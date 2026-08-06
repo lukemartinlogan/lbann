@@ -259,8 +259,8 @@ target_sources(lbannv2
 )
 target_link_libraries(lbannv2
   PUBLIC
-  torch
   spdlog::spdlog
+  torch
 )
 set_target_properties(lbannv2
   PROPERTIES
