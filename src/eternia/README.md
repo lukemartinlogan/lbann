@@ -88,9 +88,24 @@ throughout, against a GPU-side cache of `blocks * slots * page` = 64 * 8 *
 256 KB = 128 MB, about 1.25% of the matrix, and reproduces the expected
 result exactly.
 
-## Next
+## Next, and what blocks it
 
-Wire into `src/layers/learning/fully_connected.cpp` behind a runtime switch,
-which needs the row-major transpose above and a decision about where the
-transposed copy lives, then validate against an LBANN model rather than a
-synthetic reference.
+Wire into `src/layers/learning/fully_connected.cpp` behind a runtime switch.
+Two things stand in the way, and the second is the larger:
+
+**The row-major transpose.** Hydrogen hands over a column-major buffer and
+the decomposition needs row-major (see above), so W has to be transposed once
+at load and somewhere has to own that copy. That is a design decision, not an
+obstacle.
+
+**LBANN cannot currently be built in this environment.** `find_package` needs
+Hydrogen, DiHydrogen, Aluminum, Conduit and protobuf, and none of them is
+present; Hydrogen in turn wants Elemental with a BLAS/LAPACK stack, built
+against CUDA 13. Until that stack exists, an integration here could be
+written but not compiled and not tested -- and an untested integration of a
+paged kernel is worth very little, on the evidence of every bug in this
+project's history, all of which were found by running something rather than
+by reading it.
+
+So the kernel below is verified standalone and the integration is scoped, but
+the integration is deliberately not attempted until it can be run.
