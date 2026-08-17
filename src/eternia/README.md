@@ -179,13 +179,44 @@ has scoped but not built:
    independent host reference across the same paging sweep as the forward,
    at 4e-07 relative or better, including with 80 of 128 pages evicted.
 
-2. `dL/dW = X * dL/dY^T` -- produces a matrix the size of W, so the GRADIENT
-   has to be paged too, not just the weights.
-3. The optimizer update over paged W and paged dW, page by page.
+2. ~~`dL/dW = X * dL/dY^T`~~ -- **done**. `WeightGradient` holds the gradient
+   in its own paged vector, because it is the same size as W and so cannot be
+   resident either:
 
-Until those exist the option is experimental: it is left in because it
-establishes that the placement itself works and isolates exactly what
-remains, not because it is usable.
+       dW[i*k + j] = sum_c dC[c*ldc + i] * X[c*ldx + j]
+
+   It is the only one of the three that WRITES a paged array, so it is the
+   only one where page-aligned block ownership matters -- and it satisfies
+   that by construction, since every element depends only on the resident dC
+   and X, so a block writes nothing outside its own pages. Its backing store
+   is created up front for the same reason the LAMMPS force vector and the
+   PME grid needed it: a hold faults a page in before the kernel writes it,
+   and a page with no blob comes back as a failed read.
+
+   `ReadWeightGradient` copies it back into Hydrogen's column-major layout.
+
+3. The optimizer update over paged W and paged dW, page by page. Still to do,
+   and now the only piece missing.
+
+All three kernels are validated together in `lbann_eternia_gemm_verify`
+against independent host references, across page sizes 4KB-256KB, 13-64
+blocks and 2-8 slots, including a non-power-of-two shape and cases evicting
+most of what they fault:
+
+| kernel          | relative error |
+|-----------------|----------------|
+| forward         | 3.5e-08        |
+| backward-input  | 4.3e-07        |
+| weight gradient | 5.2e-08        |
+
+Each is checked separately rather than assumed to follow from the others:
+they are three different kernels with three different access patterns, and
+this project has repeatedly found that the second and third are where an
+assumption breaks.
+
+Until the optimizer step exists the host-weights option remains experimental:
+the pieces are in place and validated, but nothing yet drives them as a
+training step.
 
 ### Larger than VRAM (the kernel, driven directly)
 

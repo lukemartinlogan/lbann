@@ -132,6 +132,33 @@ bool Forward(Context* ctx, const float* x_device, int ldx, int n,
 bool BackwardInput(Context* ctx, const float* dc_device, int ldc, int n,
                    float* dx_device, int ldx);
 
+/**
+ * dW = dC * X^T, the gradient with respect to the WEIGHTS, held paged.
+ *
+ *     dW[i*k + j] = sum_c dC[c*ldc + i] * X[c*ldx + j]
+ *
+ * This is the piece that makes out-of-core training a real problem rather
+ * than a kernel swap: dW is the same size as W, so it cannot live in GPU
+ * memory either, and it is WRITTEN rather than read.
+ *
+ * That matters for correctness, not just capacity. Page caches are per block
+ * and writeback granularity is a page, so two blocks owning parts of one page
+ * would each cache it, each fill their own part, and each flush the whole
+ * thing. Here every element of dW depends only on the resident dC and X, so a
+ * block can own a PAGE-ALIGNED slice and write nothing outside it, and the
+ * hazard does not arise.
+ *
+ * Call ReadWeightGradient to copy the result back out, page by page.
+ */
+bool WeightGradient(Context* ctx, const float* dc_device, int ldc, int n,
+                    const float* x_device, int ldx);
+
+/**
+ * Copy the paged weight gradient back into a host buffer laid out the way
+ * Hydrogen holds W: column-major (h x w) with leading dimension `ldim`.
+ */
+bool ReadWeightGradient(Context* ctx, float* dw_colmajor, int ldim);
+
 Stats GetStats(Context* ctx);
 
 /** Never null. */

@@ -172,6 +172,39 @@ int main(int argc, char** argv)
     }
   }
 
+  // ---- weight gradient: dW = dC * X^T, paged and WRITTEN ----
+  // The only one of the three that writes a paged array, so it is also the
+  // only one where page-aligned block ownership matters.
+  std::vector<double> refdW(static_cast<size_t>(h) * w, 0.0);
+  for (int i = 0; i < m; ++i) {
+    for (int j = 0; j < k; ++j) {
+      double acc = 0.0;
+      for (int c = 0; c < n; ++c) {
+        acc += static_cast<double>(hdC[static_cast<size_t>(c) * m + i]) *
+               static_cast<double>(X[static_cast<size_t>(c) * k + j]);
+      }
+      // stored the way Hydrogen holds W: column-major (h x w), (j, i)
+      refdW[static_cast<size_t>(i) * h + j] = acc;
+    }
+  }
+  double gmax = 0.0, gpeak = 0.0;
+  if (!eternia_lbann::WeightGradient(ctx, dDC, m, n, dX, k)) {
+    std::fprintf(stderr, "WeightGradient failed: %s\n", eternia_lbann::LastError());
+    return 1;
+  }
+  {
+    std::vector<float> gotdW(static_cast<size_t>(h) * w, 0.0f);
+    if (!eternia_lbann::ReadWeightGradient(ctx, gotdW.data(), h)) {
+      std::fprintf(stderr, "ReadWeightGradient failed: %s\n",
+                   eternia_lbann::LastError());
+      return 1;
+    }
+    for (size_t q = 0; q < gotdW.size(); ++q) {
+      gpeak = std::max(gpeak, std::fabs(refdW[q]));
+      gmax = std::max(gmax, std::fabs(refdW[q] - static_cast<double>(gotdW[q])));
+    }
+  }
+
   const auto st = eternia_lbann::GetStats(ctx);
   double maxd = 0.0, peak = 0.0;
   for (size_t i = 0; i < got.size(); ++i) {
@@ -182,16 +215,19 @@ int main(int argc, char** argv)
   // tolerance scales with sqrt(k) as well as with the magnitude present.
   const double tol = 1e-5 * std::max(peak, 1.0) * std::sqrt(static_cast<double>(k));
   const double btol = 1e-5 * std::max(bpeak, 1.0) * std::sqrt(static_cast<double>(m));
-  const bool ok = (maxd <= tol) && (bmax <= btol) && (st.get_errors == 0);
+  const double gtol = 1e-5 * std::max(gpeak, 1.0) * std::sqrt(static_cast<double>(n));
+  const bool ok = (maxd <= tol) && (bmax <= btol) && (gmax <= gtol) &&
+                  (st.get_errors == 0);
 
   std::printf("W=%dx%d (W^T = %dx%d)  X=%dx%d  page=%lluKB blocks=%u slots=%u\n"
               "  faults=%llu evicts=%llu get_errors=%llu\n"
               "  fwd max|diff|=%.4e peak=%.4e tol=%.4e\n"
-              "  bwd max|diff|=%.4e peak=%.4e tol=%.4e\n%s\n",
+              "  bwd max|diff|=%.4e peak=%.4e tol=%.4e\n"
+              "  dW  max|diff|=%.4e peak=%.4e tol=%.4e\n%s\n",
               h, w, m, k, k, n, (unsigned long long)page_kb, blocks, slots,
               (unsigned long long)st.faults, (unsigned long long)st.evicts,
               (unsigned long long)st.get_errors, maxd, peak, tol,
-              bmax, bpeak, btol, ok ? "PASS" : "FAIL");
+              bmax, bpeak, btol, gmax, gpeak, gtol, ok ? "PASS" : "FAIL");
   eternia_lbann::Destroy(ctx);
   return ok ? 0 : 1;
 }

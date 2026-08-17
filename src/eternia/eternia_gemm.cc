@@ -44,6 +44,13 @@ static constexpr u32 kYieldLaneBytes = 256;
 
 #if defined(ETERNIA_LBANN_CORO)
 
+/** Wait out this block's writebacks by PARKING, not spinning. */
+__device__ gy::YCoroTask FlushWaitCoro(gv::DeviceVector<float>& v)
+{
+  CLIO_CO_YIELD_WHEN((v.ReapFlushed(), v.ReapFetched()),
+                     v.AnyTransferInFlight(), v.FlushWaitTag());
+}
+
 /**
  * C += W * X for this block's page-aligned slice of W.
  *
@@ -162,6 +169,69 @@ __device__ gy::YCoroMain BackwardCoro(gv::DeviceVector<float> W,
   co_return;
 }
 
+/**
+ * dW = dC * X^T for this block's page-aligned slice of dW.
+ *
+ * Every element depends only on the resident dC and X, so a block writes
+ * nothing outside its own pages -- which is what makes a written paged array
+ * safe here without the cross-block coordination the PME grid needed.
+ */
+__device__ gy::YCoroMain GradCoro(gv::DeviceVector<float> dW, const float* dC,
+                                  int ldc, const float* X, int ldx, u64 m,
+                                  u64 k, u64 n, const u64* elem_lo,
+                                  const u64* elem_hi, u32 block)
+{
+  u64 run = 0;
+  const u64 e0 = elem_lo[block], e1 = elem_hi[block];
+  const u64 pe = dW.h_->elems_per_page_;
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    dW.DropAll();
+  }
+  __syncthreads();
+
+  for (u64 off = e0; off < e1;) {
+    const u64 seg_end = ((off / pe) + 1) * pe < e1 ? ((off / pe) + 1) * pe : e1;
+    co_await dW.HoldPageCoro(off, seg_end - off, &run);
+
+    for (u64 e = off + threadIdx.x; e < seg_end; e += blockDim.x) {
+      const u64 i = e / k;
+      const u64 j = e - i * k;
+      double acc = 0.0;
+      for (u64 c = 0; c < n; ++c) {
+        acc += static_cast<double>(dC[c * ldc + i]) *
+               static_cast<double>(X[c * ldx + j]);
+      }
+      // Assignment, not accumulation: this is the whole gradient for the
+      // mini-batch, so a page that was never written before does not have to
+      // have existed.
+      dW[e] = static_cast<float>(acc);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      dW.BeginFlush(off, seg_end - off);
+    }
+    __syncthreads();
+    off = seg_end;
+  }
+  co_await FlushWaitCoro(dW);
+}
+
+__global__ void GradKernel(clio::run::IpcManagerGpuInfo info,
+                           gv::DeviceVector<float> dW, const float* dC, int ldc,
+                           const float* X, int ldx, u64 m, u64 k, u64 n,
+                           const u64* elem_lo, const u64* elem_hi,
+                           gy::YieldableView<> yv, gy::YieldStackView ys)
+{
+  CLIO_GPU_INIT(info, nullptr);
+  dW.block_override_ = yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(GradCoro(dW, dC, ldc, X, ldx, m, k, n, elem_lo, elem_hi,
+                          yv.Block()));
+}
+
 __global__ void BackwardKernel(clio::run::IpcManagerGpuInfo info,
                                gv::DeviceVector<float> W, const float* dC,
                                int ldc, float* dX, int ldx, u64 m, u64 k, u64 n,
@@ -230,6 +300,9 @@ struct Context
   u64 m = 0, k = 0;   // W^T shape: m = w, k = h
 #if defined(ETERNIA_LBANN_CORO)
   gv::Vector<float>* W = nullptr;
+  /** The weight gradient, paged: it is the same size as W, so it cannot be
+   *  resident either. Created lazily -- inference never needs it. */
+  gv::Vector<float>* dW = nullptr;
   u64* d_lo = nullptr;
   u64* d_hi = nullptr;
 #endif
@@ -307,6 +380,7 @@ void Destroy(Context* ctx)
   if (!ctx) return;
 #if defined(ETERNIA_LBANN_CORO)
   delete ctx->W;
+  delete ctx->dW;
   if (ctx->d_lo) cudaFree(ctx->d_lo);
   if (ctx->d_hi) cudaFree(ctx->d_hi);
 #endif
@@ -428,6 +502,108 @@ bool BackwardInput(Context* ctx, const float* dc_device, int ldc, int n,
 #endif
 }
 
+bool WeightGradient(Context* ctx, const float* dc_device, int ldc, int n,
+                    const float* x_device, int ldx)
+{
+#if !defined(ETERNIA_LBANN_CORO)
+  (void)ctx; (void)dc_device; (void)ldc; (void)n; (void)x_device; (void)ldx;
+  SetErr("built without the paged backend");
+  return false;
+#else
+  if (!ctx || !dc_device || !x_device) {
+    SetErr("WeightGradient: null argument");
+    return false;
+  }
+  if (ctx->dW == nullptr) {
+    try {
+      ctx->dW = new gv::Vector<float>(std::string(ctx->cfg.tag) + "_grad",
+                                      {ctx->cfg.gpu_id}, ctx->cfg.page_bytes,
+                                      ctx->cfg.nblocks, ctx->cfg.slots,
+                                      ctx->m * ctx->k);
+    } catch (const std::exception& e) {
+      SetErr(e.what());
+      return false;
+    }
+    // The gradient is WRITTEN, and a hold faults a page in before the kernel
+    // writes it -- a page whose blob does not exist yet comes back as a failed
+    // get. Create them once. Same trap as the LAMMPS force vector and the PME
+    // grid.
+    clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+    const u64 pe = ctx->cfg.page_bytes / sizeof(float);
+    const u64 np = (ctx->m * ctx->k + pe - 1) / pe;
+    std::vector<float> zeros(pe, 0.0f);
+    for (u64 p = 0; p < np; ++p) {
+      char nm[32];
+      gv::PageBlobName(p, nm);
+      auto f = core.AsyncPutBlob(ctx->dW->TagId(), std::string(nm), 0,
+                                 zeros.size() * sizeof(float),
+                                 reinterpret_cast<const char*>(zeros.data()), 1.0f);
+      f.Wait();
+      if (f.get() == nullptr || f->GetReturnCode() != 0) {
+        SetErr("WeightGradient: could not create the gradient's backing store");
+        return false;
+      }
+    }
+  }
+
+  auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(ctx->cfg.gpu_id);
+  auto ddW = ctx->dW->GetDevice(ctx->cfg.gpu_id);
+  YieldRunner runner(ctx->cfg.nblocks, ctx->cfg.nthreads);
+  const u32 rounds = runner.Run(
+    [&](dim3 g, dim3 b, gy::YieldableView<> v, gy::YieldStackView sv) {
+      GradKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+        gpu, ddW, dc_device, ldc, x_device, ldx, ctx->m, ctx->k,
+        static_cast<u64>(n), ctx->d_lo, ctx->d_hi, v, sv);
+    });
+  const cudaError_t le = cudaGetLastError();
+  if (le != cudaSuccess) { SetErr(cudaGetErrorString(le)); return false; }
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    SetErr(cudaGetErrorString(cudaGetLastError()));
+    return false;
+  }
+  if (rounds == 0) { SetErr("yield driver made no progress"); return false; }
+  return true;
+#endif
+}
+
+bool ReadWeightGradient(Context* ctx, float* dw_colmajor, int ldim)
+{
+#if !defined(ETERNIA_LBANN_CORO)
+  (void)ctx; (void)dw_colmajor; (void)ldim;
+  return false;
+#else
+  if (!ctx || !ctx->dW || !dw_colmajor) {
+    SetErr("ReadWeightGradient: nothing to read");
+    return false;
+  }
+  clio::cte::core::Client core(clio::cte::core::kCtePoolId);
+  const u64 total = ctx->m * ctx->k;
+  const u64 pe = ctx->cfg.page_bytes / sizeof(float);
+  const u64 np = (total + pe - 1) / pe;
+  std::vector<float> buf(pe);
+  for (u64 p = 0; p < np; ++p) {
+    char nm[32];
+    gv::PageBlobName(p, nm);
+    auto f = core.AsyncGetBlob(ctx->dW->TagId(), std::string(nm), 0,
+                               buf.size() * sizeof(float), 0u,
+                               reinterpret_cast<char*>(buf.data()));
+    f.Wait();
+    if (f.get() == nullptr || f->GetReturnCode() != 0) {
+      SetErr("ReadWeightGradient: a page read failed");
+      return false;
+    }
+    const u64 e0 = p * pe;
+    const u64 e1 = (e0 + pe < total) ? (e0 + pe) : total;
+    for (u64 e = e0; e < e1; ++e) {
+      // row-major index e over dW maps to Hydrogen's column-major (j, i)
+      const u64 i = e / ctx->k, j = e - i * ctx->k;
+      dw_colmajor[i * static_cast<u64>(ldim) + j] = buf[e - e0];
+    }
+  }
+  return true;
+#endif
+}
+
 Stats GetStats(Context* ctx) { return ctx ? ctx->stats : Stats(); }
 
 #endif  // !CTP_IS_DEVICE_PASS
@@ -448,6 +624,8 @@ void Destroy(Context*) {}
 bool UploadWeights(Context*, const float*, int) { return false; }
 bool Forward(Context*, const float*, int, int, float*, int) { return false; }
 bool BackwardInput(Context*, const float*, int, int, float*, int) { return false; }
+bool WeightGradient(Context*, const float*, int, int, const float*, int) { return false; }
+bool ReadWeightGradient(Context*, float*, int) { return false; }
 Stats GetStats(Context*) { return Stats(); }
 }  // namespace eternia_lbann
 
