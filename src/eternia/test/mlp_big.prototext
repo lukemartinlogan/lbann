@@ -1,0 +1,42 @@
+# A LARGE variant: 4096 -> 4096 -> 4, so fc1 holds a 64 MiB weight
+# matrix.
+#
+# Everything else in this directory uses weights of 2 MiB or less,
+# which is enough to show the paging mechanism working but not enough
+# to show it holding at a size where paging is the only option. 64 MiB
+# against a few MiB of cache is a ratio a real out-of-core layer would
+# actually run at.
+trainer { mini_batch_size: 256 }
+data_reader {
+  reader {
+    name: "synthetic"
+    role: "train"
+    shuffle: false
+    num_samples: 256
+    num_labels: 4
+    synth_dimensions: "4096"
+    validation_fraction: 0.0
+    absolute_sample_count: 0
+    fraction_of_data_to_use: 1.0
+  }
+}
+model {
+  data_layout: "data_parallel"
+  num_epochs: 2
+
+  layer { name: "data" children: "fc1" data_layout: "data_parallel"
+          input { data_field: "samples" } }
+  layer { name: "lbl" data_layout: "data_parallel"
+          input { data_field: "labels" } }
+  layer { parents: "data" name: "fc1" data_layout: "data_parallel"
+          fully_connected { num_neurons: 4096 has_bias: false transpose: true } }
+  layer { parents: "fc1" name: "relu1" data_layout: "data_parallel" relu {} }
+  layer { parents: "relu1" name: "fc2" data_layout: "data_parallel"
+          fully_connected { num_neurons: 4 has_bias: false transpose: true } }
+  layer { parents: "fc2" name: "prob" data_layout: "data_parallel" softmax {} }
+  layer { parents: "prob" parents: "lbl" name: "ce" data_layout: "data_parallel" cross_entropy {} }
+
+  objective_function { layer_term { layer: "ce" } }
+  callback { print { interval: 1 } }
+}
+optimizer { sgd { learn_rate: 0.01 momentum: 0.0 } }

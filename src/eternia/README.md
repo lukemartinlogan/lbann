@@ -372,6 +372,28 @@ discarded:
 | `bp-weights` | 2.9e-07 |
 | objective | 2.11687 / 2.06452 / 1.87059 -- identical to stock |
 
+At a size where paging is the only option
+-----------------------------------------
+
+2 MiB of weights shows the mechanism but not that it holds at a size where
+paging is the point. `mlp_big.prototext` (4096 -> 4096 -> 4) gives fc1 a 64 MiB
+weight matrix, and it was run at two cache ratios with the paged store owning
+the weights:
+
+| resident cache | ratio | faults / evicts | wall clock | objective |
+|----------------|-------|-----------------|-----------|-----------|
+| stock, W in VRAM | --  | --              | 3.2 s     | 2.20537 / 2.24280 |
+| 4 MiB          | 1/16  | 4096 / 4032     | --        | 2.20537 / 2.24280 |
+| 1 MiB          | 1/64  | 8192 / 8160     | 16 s      | 2.20537 / 2.24280 |
+
+Identical to every digit at 1/64 residency, with `get_errors=0` and the cache
+turning over essentially completely.
+
+The cost is real and worth stating plainly: about 5x wall clock against a stock
+run that keeps the whole matrix in VRAM. That is the trade this whole thing
+offers -- it is not a speedup, it is a way to run a layer that otherwise would
+not fit, and comparing it against a configuration that fits will always lose.
+
 That is the claim this integration actually supports: a layer whose weights do
 not fit in the memory available to it trains to the same answer.
 
