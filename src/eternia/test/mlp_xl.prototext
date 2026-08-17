@@ -1,0 +1,40 @@
+# 16384 -> 16384 -> 4: fc1 holds a 1 GiB weight matrix.
+#
+# This is the size that decides whether the integration saves VRAM at
+# all. The Clio runtime has a fixed ~1.2 GiB GPU footprint, so below
+# roughly a gigabyte of weights the paged path costs MORE VRAM than
+# keeping W resident. See the peak-VRAM table in the README.
+trainer { mini_batch_size: 256 }
+data_reader {
+  reader {
+    name: "synthetic"
+    role: "train"
+    shuffle: false
+    num_samples: 256
+    num_labels: 4
+    synth_dimensions: "16384"
+    validation_fraction: 0.0
+    absolute_sample_count: 0
+    fraction_of_data_to_use: 1.0
+  }
+}
+model {
+  data_layout: "data_parallel"
+  num_epochs: 2
+
+  layer { name: "data" children: "fc1" data_layout: "data_parallel"
+          input { data_field: "samples" } }
+  layer { name: "lbl" data_layout: "data_parallel"
+          input { data_field: "labels" } }
+  layer { parents: "data" name: "fc1" data_layout: "data_parallel"
+          fully_connected { num_neurons: 16384 has_bias: false transpose: true } }
+  layer { parents: "fc1" name: "relu1" data_layout: "data_parallel" relu {} }
+  layer { parents: "relu1" name: "fc2" data_layout: "data_parallel"
+          fully_connected { num_neurons: 4 has_bias: false transpose: true } }
+  layer { parents: "fc2" name: "prob" data_layout: "data_parallel" softmax {} }
+  layer { parents: "prob" parents: "lbl" name: "ce" data_layout: "data_parallel" cross_entropy {} }
+
+  objective_function { layer_term { layer: "ce" } }
+  callback { print { interval: 1 } }
+}
+optimizer { sgd { learn_rate: 0.01 momentum: 0.0 } }

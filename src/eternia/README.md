@@ -397,11 +397,37 @@ not fit, and comparing it against a configuration that fits will always lose.
 That is the claim this integration actually supports: a layer whose weights do
 not fit in the memory available to it trains to the same answer.
 
-**It does not lift the VRAM ceiling for a whole model.** Measured separately:
-LBANN still OOMs at 8.00 GiB because everything else it allocates is resident.
-What is demonstrated is narrower and worth stating exactly -- one layer's
-weights can be larger than GPU memory and both its forward and backward passes
-still compute the right answer.
+**It lifts the VRAM ceiling only above about a gigabyte of weights.** This
+corrects what this file said for several revisions. Peak GPU memory, sampled
+with nvidia-smi across the whole run, with `HOST_WEIGHTS` + `OWN_WEIGHTS` and a
+cache of a few MiB:
+
+| fc1 weights | stock (W in VRAM) | paged |
+|-------------|-------------------|-------|
+| 2 MiB       | 158 MiB           | 1238 MiB |
+| 64 MiB      | 298 MiB           | 1250 MiB |
+| 256 MiB     | 408 MiB           | 1266 MiB |
+| **1 GiB**   | **4298 MiB**      | **1326 MiB** |
+
+The paged line is nearly FLAT: 254 MiB more weights buys 28 MiB more VRAM. The
+stock line grows with the weights, and faster than one-for-one because the
+optimizer's gradient buffer is W-sized too.
+
+They cross between 256 MiB and 1 GiB, and the reason is the Clio runtime's own
+GPU footprint, which is fixed at roughly 1.2 GiB whatever the model does.
+BELOW that crossover the paged path costs several times MORE VRAM than simply
+keeping the weights resident -- so on a small layer this is strictly worse, and
+the earlier claim that it "does not lift the VRAM ceiling" was drawn entirely
+from models on the wrong side of it.
+
+At 1 GiB the saving is real: **4298 MiB -> 1326 MiB, a 3.2x reduction**, with
+the objective identical to stock (1.92597 / 5.80251) and `get_errors=0`. The
+cost is time -- 118 s against 4.4 s, roughly 27x, at 16384 faults with a cache
+1/128 the size of the matrix.
+
+The single most valuable thing that could be done to this integration is
+therefore not a kernel change at all: it is shrinking that 1.2 GiB fixed
+runtime footprint, which is what puts the crossover a gigabyte up.
 
 ### Larger than VRAM (the kernel, driven directly)
 
