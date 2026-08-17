@@ -28,6 +28,26 @@ CLIO_SERVER_CONF=clio.yaml ./build-eternia/lbann_eternia_gemm_bench \
   --m 65536 --k 40960 --n 16 --page-kb 256 --blocks 64 --slots 8 --ones
 ```
 
+## The transpose is free in the case that matters
+
+An earlier version of this file said wiring into LBANN "needs W transposed
+once at load". That is only half right, and the half that is wrong is the
+interesting one.
+
+Hydrogen stores a matrix COLUMN-major: for W of height h and width w,
+element (i, j) sits at j*h + i. This kernel reads ROW-major: R[a][b] at
+a*k + b. Take the SAME buffer and read it row-major with m = w and k = h:
+
+    R[a][b] = buf[a*h + b] = W(b, a)      i.e.  R = W-transpose
+
+So when LBANN's fully-connected layer computes C = W^T * X -- its
+`m_transpose == true` path -- the raw column-major buffer IS the row-major
+matrix this kernel wants, with no copy and no transpose kernel. The layouts
+are duals and the reinterpretation is free.
+
+The other path, C = W * X, does need a real transpose, and that is the case
+to fall back to El::Gemm on rather than pay for.
+
 ## W is stored ROW-MAJOR, and that is not incidental
 
 Hydrogen is column-major. This code stores W row-major on purpose: a page of
@@ -98,14 +118,20 @@ the decomposition needs row-major (see above), so W has to be transposed once
 at load and somewhere has to own that copy. That is a design decision, not an
 obstacle.
 
-**LBANN cannot currently be built in this environment.** `find_package` needs
-Hydrogen, DiHydrogen, Aluminum, Conduit and protobuf, and none of them is
-present; Hydrogen in turn wants Elemental with a BLAS/LAPACK stack, built
-against CUDA 13. Until that stack exists, an integration here could be
-written but not compiled and not tested -- and an untested integration of a
-paged kernel is worth very little, on the evidence of every bug in this
-project's history, all of which were found by running something rather than
-by reading it.
+**LBANN now builds in this environment**, which it did not when this file was
+first written. The whole dependency stack is built from source through
+`scripts/superbuild` (OpenBLAS, Aluminum, Hydrogen with CUDA, DiHydrogen,
+protobuf, cereal, spdlog, zstr, Catch2, Clara, Conduit + HDF5) against CUDA
+13.3 and cuDNN 9, and `bin/lbann` links and runs with LBANN_HAS_GPU,
+LBANN_HAS_CUDA and LBANN_HAS_CUDNN all set.
 
-So the kernel below is verified standalone and the integration is scoped, but
-the integration is deliberately not attempted until it can be run.
+Getting there needed nine toolchain fixes to LBANN itself, all committed on
+this branch: CUDA 13 removed CUDA::nvToolsExt (referenced twice), Thrust
+dropped system/cuda/detail/par.h and thrust::binary_function, cuFFT dropped
+three error enumerators, data_utils links Conduit unconditionally, the
+superbuild builds non-PIC statics, and conda's OpenSSL collides with the
+system one at link time.
+
+So the integration can now be compiled and run, which is the only kind worth
+having here: every defect in this project was found by running something
+rather than by reading it.
