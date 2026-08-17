@@ -454,53 +454,45 @@ It is NOT the known per-fault SHM segment growth. Holding the weights fixed at
 and moves RSS by 1% (2654 -> 2624 MB). The amplification tracks DATA, not
 paging activity.
 
-Partially localised by reading `/proc/<pid>/smaps`, sampled twice a second and
-kept at the highest `VmRSS` seen. Broken down by mapping class:
+Localised, by sampling `/proc/<pid>/statm` at ~1 kHz (126,036 samples per run;
+a twice-a-second poll missed most of the peak and gave a different and wrong
+picture) and dumping `smaps` at each new maximum. At the TRUE peak:
 
 | W (MiB) | total | anon | `clio_rambdev` | `/dev/zero` | `chi_metadata` |
 |---------|-------|------|----------------|-------------|----------------|
-| 64      | 2561  | 1496 | 193            | 192         | 299 |
-| 256     | 4354  | 2212 | 1025           | 436         | 299 |
-| 1024    | 6257  | 4270 | 1024           | 284         | 299 |
+| 2       | 1823  | 1154 | 0              | 22          | 299 |
+| 64      | 2584  | 1496 | 217            | 192         | 299 |
+| 256     | 4126  | 2214 | 1025           | 208         | 299 |
+| 1024    | 11419 | 5333 | 4097           | 1308        | 299 |
 
-Three things are ruled out, each by measurement rather than reasoning:
+Both host-side stores hold exactly TWICE what the design needs, and the ratios
+are stable across two decades of W:
 
-- **Not the config.** The CTE `ram` tier's `capacity_limit` (1024 / 4096 / 8192
-  MB) and the `clio_bdev` pool's `capacity` (256MB / 1GB / 4GB) each move peak
-  RSS by less than 0.1% at small weights. Unlike the `hbm` tier, neither is
-  preallocated.
+- **The RAM bdev holds 4x W.** The live blob data is W and dW, i.e. 2x W. The
+  bdev is at 4097 MiB for a 1 GiB weight matrix and 1025 MiB for 256 MiB --
+  2.00x the live bytes in both cases. (At 2 MiB it is zero: everything fits in
+  the 64 MB `hbm` tier and nothing reaches RAM.)
+- **Anonymous memory grows by 4x W** above a fixed 1154 MiB baseline. LBANN's
+  own host copy of the linearity and its CPU gradient buffer account for 2x W.
+
+So the ~9.5x amplification decomposes as roughly 4x W in the CTE's RAM bdev,
+4x W in anonymous allocations, and a fixed ~1.5 GiB of baseline and metadata.
+Each of the two stores is a factor of two larger than what it holds, which is
+too clean to be coincidence and is the specific thing to chase next. The
+mechanism is NOT established -- double buffering on the put path, a retained
+prior generation, and allocator round-up all predict the same 2x -- and it
+should be identified rather than guessed, since three previous guesses in this
+file were wrong.
+
+Three things are ruled out, each by measurement:
+
+- **Not the config.** The CTE `ram` tier's `capacity_limit` does not bound the
+  bdev's footprint at all: at 2048MB and 4096MB the bdev is 4097 MiB either
+  way. It governs placement accounting, not memory. Unlike the `hbm` tier, it
+  is not preallocated and shrinking it does not help.
 - **Not paging activity.** 8x fewer faults at fixed weights moves RSS 1%.
-- **Not an unbounded leak.** The RAM bdev goes 582 -> 768 MB from one epoch to
-  two and then stops, unchanged at four.
-
-The growth is in ANONYMOUS memory, which rises about 2.9x W across the range
-while the RAM bdev saturates at the `clio_bdev` capacity of 1 GB and the
-metadata segment stays fixed at 299 MiB. LBANN's own host copy of the linearity
-and its CPU gradient buffer account for 2x W of the anonymous growth by design,
-leaving roughly 0.9x W unattributed.
-
-Two caveats on this table, both of which matter:
-
-1. An earlier revision read the RAM bdev as holding "3x W, one entire extra
-   copy of the weights". That was wrong -- arithmetic done loosely between MB
-   and MiB, and without noticing the bdev SATURATES. It does not scale with the
-   weights at all, and it is not where the amplification comes from.
-2. The totals above were LOWER BOUNDS, taken twice a second, and the peak is
-   transient enough that they missed most of it. Re-sampled at ~1 kHz by
-   polling `statm` directly (126,036 samples per run instead of ~90), the peak
-   is 11979 MB -- agreeing with `/usr/bin/time -v` -- and the composition at the
-   true peak is different again:
-
-   | mapping | RSS at true peak |
-   |---------|------------------|
-   | `[anon rw]` | 5333 MiB |
-   | `clio_rambdev` | 4097 MiB |
-   | `/dev/zero` | 1308 MiB |
-   | `chi_metadata_segment` | 299 MiB |
-
-   So the RAM bdev does NOT saturate at 1 GB, as the undersampled data
-   suggested -- it reaches 4097 MiB, which is the CTE `ram` tier's
-   `capacity_limit` of 4096MB.
+- **Not an unbounded leak.** The bdev reaches steady state after the first
+  optimizer step and is unchanged from two epochs to four.
 
 ### The tier size is not the lever, and the run that suggested it was dead
 
