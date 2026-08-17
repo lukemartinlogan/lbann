@@ -485,12 +485,42 @@ Two caveats on this table, both of which matter:
    copy of the weights". That was wrong -- arithmetic done loosely between MB
    and MiB, and without noticing the bdev SATURATES. It does not scale with the
    weights at all, and it is not where the amplification comes from.
-2. The totals here are LOWER BOUNDS. `/usr/bin/time -v` reports 11697 MB peak
-   for the 1 GiB model where this sampler's best was 6257 MiB, so a
-   twice-a-second poll misses most of a transient peak. The composition above is
-   real but it is the composition of a sampled moment, not of the true maximum,
-   and the missing ~5 GB is the next thing to chase -- with a sampler that can
-   actually catch it.
+2. The totals above were LOWER BOUNDS, taken twice a second, and the peak is
+   transient enough that they missed most of it. Re-sampled at ~1 kHz by
+   polling `statm` directly (126,036 samples per run instead of ~90), the peak
+   is 11979 MB -- agreeing with `/usr/bin/time -v` -- and the composition at the
+   true peak is different again:
+
+   | mapping | RSS at true peak |
+   |---------|------------------|
+   | `[anon rw]` | 5333 MiB |
+   | `clio_rambdev` | 4097 MiB |
+   | `/dev/zero` | 1308 MiB |
+   | `chi_metadata_segment` | 299 MiB |
+
+   So the RAM bdev does NOT saturate at 1 GB, as the undersampled data
+   suggested -- it reaches 4097 MiB, which is the CTE `ram` tier's
+   `capacity_limit` of 4096MB.
+
+### The tier size is not the lever, and the run that suggested it was dead
+
+That 4097 MiB looked like the `hbm` finding repeating, so it was tested. It is
+not:
+
+| `ram` tier | peak RSS | trains? |
+|------------|----------|---------|
+| 1024 MB    | 6563 MB  | **no** |
+| 2048 MB    | 11981 MB | yes, matches stock |
+| 4096 MB    | 11979 MB | yes, matches stock |
+
+The 5.4 GB "saving" at 1024 MB is a dead run. There is no NVMe tier to spill
+to, so `WeightGradient` cannot create the gradient's backing store, and the
+whole layer degrades. Once the tier is merely large enough to work, its size
+does not affect peak RSS at all -- 2048 and 4096 MB give the same number.
+
+This is the trap already recorded for the benchmarks in this project: a
+throttled or failed run reports as an improvement. The only thing that
+distinguished it here was checking that the run still produced an objective.
 
 ### Larger than VRAM (the kernel, driven directly)
 

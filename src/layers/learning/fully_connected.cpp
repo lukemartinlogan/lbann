@@ -1061,6 +1061,14 @@ void fully_connected_layer<TensorDataType, T_layout, Dev>::fp_compute()
                    El::TypeTraits<TensorDataType>::Zero(),
                    ref);
         }
+        // In own-weights mode a fallback is NOT a safe degradation. Hydrogen's
+        // copy of W is stale from the first optimizer step onward, so falling
+        // back to El::Gemm computes with the pre-training weights and the run
+        // trains to a wrong answer with nothing but a warning to show for it.
+        // Fail loudly instead; the fallback is only sound when the paged store
+        // and Hydrogen still agree.
+        static const bool own_fp =
+          (std::getenv("LBANN_ETERNIA_FC_OWN_WEIGHTS") != nullptr);
         if (eternia_fc_gemm(
               m_eternia_ctx, m_eternia_h, m_eternia_w, m_eternia_uploaded, this,
               reinterpret_cast<const float*>(host_lin.LockedBuffer()),
@@ -1084,6 +1092,12 @@ void fully_connected_layer<TensorDataType, T_layout, Dev>::fp_compute()
                       << " rel=" << (peak > 0 ? maxd / peak : 0.0) << std::endl;
           }
           return;
+        }
+        if (own_fp) {
+          LBANN_ERROR("eternia: ", eternia_lbann::LastError(),
+                      " -- cannot fall back to El::Gemm under "
+                      "LBANN_ETERNIA_FC_OWN_WEIGHTS, because the paged store "
+                      "holds the current weights and Hydrogen's copy is stale");
         }
       }
     }
@@ -1112,6 +1126,8 @@ void fully_connected_layer<TensorDataType, T_layout, Dev>::bp_compute()
         El::Matrix<TensorDataType, El::Device::CPU> host_lin;
         El::Copy(lin, host_lin);
 
+        static const bool own =
+          (std::getenv("LBANN_ETERNIA_FC_OWN_WEIGHTS") != nullptr);
         auto* opt = this->get_weights(0).get_optimizer();
         TensorDataType dst_scale = El::TypeTraits<TensorDataType>::Zero(),
                        gradient_scale = El::TypeTraits<TensorDataType>::Zero();
@@ -1163,8 +1179,6 @@ void fully_connected_layer<TensorDataType, T_layout, Dev>::bp_compute()
               opt != nullptr ? reinterpret_cast<float*>(host_dw.Buffer())
                              : nullptr,
               opt != nullptr ? host_dw.LDim() : 0)) {
-          static const bool own =
-            (std::getenv("LBANN_ETERNIA_FC_OWN_WEIGHTS") != nullptr);
           if (own && opt != nullptr) {
             // The paged store owns the weights: step it in place and leave
             // LBANN's optimizer nothing to do. This is what removes the
@@ -1277,6 +1291,12 @@ void fully_connected_layer<TensorDataType, T_layout, Dev>::bp_compute()
             }
           }
           return;
+        }
+        if (own) {
+          LBANN_ERROR("eternia: ", eternia_lbann::LastError(),
+                      " -- cannot fall back to El::Gemm under "
+                      "LBANN_ETERNIA_FC_OWN_WEIGHTS, because the paged store "
+                      "holds the current weights and Hydrogen's copy is stale");
         }
       }
     }
