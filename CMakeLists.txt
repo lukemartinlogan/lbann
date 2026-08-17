@@ -384,7 +384,7 @@ if (LBANN_HAS_CUDA)
 
   set(LBANN_CUDA_LIBS
     CUDA::cudart
-    CUDA::nvToolsExt
+    $<$<TARGET_EXISTS:CUDA::nvToolsExt>:CUDA::nvToolsExt>
     CUDA::cufft
     cuda::cudnn)
 
@@ -410,8 +410,21 @@ if (LBANN_HAS_CUDA)
   set(LBANN_HAS_NVSHMEM "${NVSHMEM_FOUND}")
 
   # This is for back-compatibility with old Hydrogen/Aluminum.
+  #
+  # CUDA 13 removed the compiled nvToolsExt library -- NVTX is header-only now
+  # and the CUDA::nvToolsExt imported target no longer exists, so the bare
+  # ALIAS below fails the configure outright. Prefer the modern header-only
+  # target, and fall back to an empty interface: this alias exists only so
+  # older Hydrogen/Aluminum can name something, and LBANN's own NVTX use is
+  # behind LBANN_WITH_NVPROF, which is off by default.
   if (NOT TARGET cuda::nvtx)
-    add_library(cuda::nvtx ALIAS CUDA::nvToolsExt)
+    if (TARGET CUDA::nvToolsExt)
+      add_library(cuda::nvtx ALIAS CUDA::nvToolsExt)
+    elseif (TARGET CUDA::nvtx3)
+      add_library(cuda::nvtx ALIAS CUDA::nvtx3)
+    else ()
+      add_library(cuda::nvtx INTERFACE IMPORTED)
+    endif ()
   endif ()
 endif (LBANN_HAS_CUDA)
 
