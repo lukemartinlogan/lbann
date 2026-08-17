@@ -502,9 +502,28 @@ Two consequences worth acting on:
   to allocate it, but it is not holding it, which is a materially different
   constraint from the one the RSS number alone implies.
 - It does not scale with page size (32 KB and 256 KB pages give the same peak),
-  which says the staging is of the whole array rather than of a flush batch.
-  That points at the bulk write paths -- `UploadWeights` and the zero-fill that
-  creates dW's backing store -- rather than at per-page writeback.
+  which says the doubling covers the whole array rather than a flush batch.
+
+### It is not in this integration's code
+
+The obvious suspects were `UploadWeights` and the zero-fill that creates dW's
+backing store, so they were read rather than assumed. Every host allocation in
+`eternia_gemm.cc` is PAGE-sized, not array-sized -- one `std::vector<float>
+buf(pe)` reused across pages in each of the upload and readback loops, and one
+`zeros(pe)` for blob creation -- and each page is written with an
+`AsyncPutBlob` that is immediately `Wait()`ed, so at most one page is in flight
+from this code at a time.
+
+So the whole-array doubling happens inside the CTE's put path, which these
+forks only call. Fixing it is work in `context-transfer-engine`, not here.
+
+The behaviour is consistent with a rewrite allocating its new generation before
+releasing the old: an optimizer step rewrites every page of W and of dW, so at
+the moment the rewrite is in flight two generations of the whole array coexist,
+giving exactly 2x live and exactly the page-size independence observed, and
+collapsing back to 1x once the old generation is released. That is a hypothesis
+that fits every measurement here, and it is stated as one -- confirming it means
+instrumenting the CTE allocator, which is outside what these forks can see.
 
 Three things are ruled out, each by measurement:
 
