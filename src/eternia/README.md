@@ -256,10 +256,29 @@ objective is IDENTICAL to the stock path:
 | eternia + host weights    | 1.93652 | 1.87546 | 1.87988 |
 
 `LBANN_ETERNIA_CHECK=1` recomputes both backward products with `El::Gemm` and
-reports the largest elementwise difference per call: `bp-weights` peaks at
-2.5e-07 relative, and `bp-input` matches bitwise -- believable here only
-because the test model's inner dimension is 4 and 32, where the standalone
-test's 256-deep sums show the expected 4e-07.
+reports the largest elementwise difference per call.
+
+`mlp.prototext` is too narrow to check one of them. Its backward sums are 4
+and 32 terms deep, few enough that the paged kernel matches `El::Gemm`
+BITWISE -- which is not evidence of correctness, because a comparison that
+cannot separate two correct implementations cannot separate a correct one from
+a subtly wrong one either. `mlp_wide.prototext` (1024 -> 512 -> 4) exists for
+that reason: at 512 terms deep the reassociated accumulation must differ, and
+the check starts carrying information.
+
+| model | `bp-input` | `bp-weights` |
+|-------|------------|--------------|
+| `mlp.prototext` (4, 32 deep)  | bitwise, uninformative | 2.5e-07 |
+| `mlp_wide.prototext` (512 deep) | 7.9e-07              | 4.0e-07 |
+
+Both models give the identical objective on all three paths, and the wide one
+also puts a 2 MB weight matrix across many pages rather than one or two:
+
+| run                     | epoch 1 | epoch 2 | epoch 3 |
+|-------------------------|---------|---------|---------|
+| `El::Gemm` (stock)      | 2.11687 | 2.06452 | 1.87059 |
+| eternia paged fwd + bwd | 2.11687 | 2.06452 | 1.87059 |
+| eternia + host weights  | 2.11687 | 2.06452 | 1.87059 |
 
 Two things this does NOT do
 ---------------------------
