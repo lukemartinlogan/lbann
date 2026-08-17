@@ -1028,7 +1028,14 @@ void fully_connected_layer<TensorDataType, T_layout, Dev>::fp_compute()
   //     buffer already IS the row-major matrix the kernel reads
   //   - no bias term, which the paged path does not apply
   //   - the matrices are local
-  static const bool want = (std::getenv("LBANN_ETERNIA_FC") != nullptr);
+  // ETERNIA_BASELINE turns the paged path OFF without changing anything else,
+  // so the same binary and the same model measure the stock El::Gemm path.
+  // It is deliberately a separate variable from LBANN_ETERNIA_FC rather than
+  // its absence: a performance comparison wants ONE thing to differ between
+  // the two runs, and asking the caller to remove a variable invites removing
+  // more than one.
+  static const bool want = (std::getenv("LBANN_ETERNIA_FC") != nullptr &&
+                            std::getenv("ETERNIA_BASELINE") == nullptr);
   if (want && Dev == El::Device::GPU &&
       std::is_same<TensorDataType, float>::value && this->m_transpose &&
       this->m_bias_scaling_factor == El::TypeTraits<TensorDataType>::Zero()) {
@@ -1112,7 +1119,8 @@ void fully_connected_layer<TensorDataType, T_layout, Dev>::bp_compute()
   // pages the forward GEMM and then falls back to El::Gemm for the backward
   // one is not a configuration anybody wants to reason about, and with the
   // weights on the host the fallback cannot run at all.
-  static const bool want = (std::getenv("LBANN_ETERNIA_FC") != nullptr);
+  static const bool want = (std::getenv("LBANN_ETERNIA_FC") != nullptr &&
+                            std::getenv("ETERNIA_BASELINE") == nullptr);
   if (want && Dev == El::Device::GPU &&
       std::is_same<TensorDataType, float>::value && this->m_transpose &&
       this->m_bias_scaling_factor == El::TypeTraits<TensorDataType>::Zero()) {
