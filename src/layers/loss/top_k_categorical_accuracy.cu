@@ -52,9 +52,9 @@ struct entry
  *  in favor of entries with smaller indices.
  */
 template <typename TensorDataType>
-struct entry_compare : ::thrust::binary_function<entry<TensorDataType>,
-                                                 entry<TensorDataType>,
-                                                 bool>
+struct entry_compare // thrust::binary_function was removed in Thrust 2.x (it aliased
+// std::binary_function, which C++17 removed). It only supplied
+// argument typedefs that modern Thrust does not consult.
 {
   __host__ __device__ bool operator()(const entry<TensorDataType>& a,
                                       const entry<TensorDataType>& b) const

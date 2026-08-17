@@ -36,7 +36,15 @@
 #include <thrust/detail/allocator/tagged_allocator.h>
 #include <thrust/device_vector.h>
 #include <thrust/memory.h>
+// CUDA 13 / CCCL removed thrust/system/cuda/detail/par.h. The type this file
+// actually needs, thrust::cuda_cub::execute_on_stream, now lives in
+// execution_policy.h. par.h was only ever a convenience header that pulled
+// that in.
+#if THRUST_MAJOR_VERSION > 2 || (THRUST_MAJOR_VERSION == 2 && THRUST_MINOR_VERSION >= 3)
+#include <thrust/system/cuda/detail/execution_policy.h>
+#else
 #include <thrust/system/cuda/detail/par.h>
+#endif
 #include <thrust/version.h>
 
 // -------------------------------------------------------------

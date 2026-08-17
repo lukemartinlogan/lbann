@@ -24,6 +24,7 @@
 // permissions and limitations under the license.
 ////////////////////////////////////////////////////////////////////////////////
 
+#include <cuda_runtime.h>   // CUDART_VERSION
 #include <lbann/utils/cufft_wrapper.hpp>
 #include <lbann/utils/exception.hpp>
 
@@ -48,12 +49,21 @@ std::string value_as_string(cufftResult_t r)
     CUFFT_VALUE_AS_STRING_CASE(CUFFT_SETUP_FAILED);
     CUFFT_VALUE_AS_STRING_CASE(CUFFT_INVALID_SIZE);
     CUFFT_VALUE_AS_STRING_CASE(CUFFT_UNALIGNED_DATA);
+// CUFFT_INCOMPLETE_PARAMETER_LIST was removed in CUDA 13's cuFFT.
+#if CUDART_VERSION < 13000
     CUFFT_VALUE_AS_STRING_CASE(CUFFT_INCOMPLETE_PARAMETER_LIST);
+#endif
     CUFFT_VALUE_AS_STRING_CASE(CUFFT_INVALID_DEVICE);
+// CUFFT_PARSE_ERROR was removed in CUDA 13's cuFFT.
+#if CUDART_VERSION < 13000
     CUFFT_VALUE_AS_STRING_CASE(CUFFT_PARSE_ERROR);
+#endif
     CUFFT_VALUE_AS_STRING_CASE(CUFFT_NO_WORKSPACE);
     CUFFT_VALUE_AS_STRING_CASE(CUFFT_NOT_IMPLEMENTED);
+// CUFFT_LICENSE_ERROR was removed in CUDA 13's cuFFT.
+#if CUDART_VERSION < 13000
     CUFFT_VALUE_AS_STRING_CASE(CUFFT_LICENSE_ERROR);
+#endif
     CUFFT_VALUE_AS_STRING_CASE(CUFFT_NOT_SUPPORTED);
   default:
     LBANN_ERROR("Unknown cufftResult_t value.");
@@ -85,18 +95,27 @@ std::string result_string(cufftResult_t r)
     return "User specified an invalid transform size";
   case CUFFT_UNALIGNED_DATA:
     return "No longer used (value=CUFFT_UNALIGNED_DATA)";
+// CUFFT_INCOMPLETE_PARAMETER_LIST was removed in CUDA 13's cuFFT.
+#if CUDART_VERSION < 13000
   case CUFFT_INCOMPLETE_PARAMETER_LIST:
     return "Missing parameters in call";
+#endif
   case CUFFT_INVALID_DEVICE:
     return "Execution of a plan was on different GPU than plan creation";
+// CUFFT_PARSE_ERROR was removed in CUDA 13's cuFFT.
+#if CUDART_VERSION < 13000
   case CUFFT_PARSE_ERROR:
     return "Internal plan database error";
+#endif
   case CUFFT_NO_WORKSPACE:
     return "No workspace has been provided prior to plan execution";
   case CUFFT_NOT_IMPLEMENTED:
     return "Function does not implement functionality for parameters given.";
+// CUFFT_LICENSE_ERROR was removed in CUDA 13's cuFFT.
+#if CUDART_VERSION < 13000
   case CUFFT_LICENSE_ERROR:
     return "Used in previous versions.";
+#endif
   case CUFFT_NOT_SUPPORTED:
     return "Operation is not supported for parameters given.";
   default:
