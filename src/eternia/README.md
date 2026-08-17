@@ -291,6 +291,32 @@ bypassing LBANN's optimizer rather than feeding it. Wiring the paged optimizer
 in properly means replacing LBANN's optimizer for that weight, which is a
 larger change than a layer hook.
 
+Under real paging pressure
+--------------------------
+
+The default geometry gives a resident cache of `nblocks * slots * page_bytes`
+= 128 MB, far larger than any test model's weights, so the defaults show the
+paged path working without ever putting it under pressure. `LBANN_ETERNIA_PAGE_KB`,
+`_BLOCKS` and `_SLOTS` shrink it, mirroring the knobs the GROMACS hook already
+had.
+
+With `PAGE_KB=4 BLOCKS=8 SLOTS=2` the cache is 64 KiB against fc1's 2 MiB of
+weights -- **1/32 of the matrix resident** -- and the layer takes 2560 faults
+against 2544 evictions, so essentially every page is fetched, used and
+discarded:
+
+| | value |
+|---|---|
+| weights | 2 MiB |
+| resident cache | 64 KiB (1/32) |
+| faults / evicts | 2560 / 2544 |
+| `bp-input` | 6.1e-07 |
+| `bp-weights` | 2.9e-07 |
+| objective | 2.11687 / 2.06452 / 1.87059 -- identical to stock |
+
+That is the claim this integration actually supports: a layer whose weights do
+not fit in the memory available to it trains to the same answer.
+
 **It does not lift the VRAM ceiling for a whole model.** Measured separately:
 LBANN still OOMs at 8.00 GiB because everything else it allocates is resident.
 What is demonstrated is narrower and worth stating exactly -- one layer's

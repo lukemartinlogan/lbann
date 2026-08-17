@@ -885,6 +885,21 @@ bool eternia_fc_ready(eternia_lbann::Context*& ctx, int& cached_h,
           std::to_string(reinterpret_cast<std::uintptr_t>(owner));
     cfg.tag = tag.c_str();
     cfg.stats = (std::getenv("LBANN_ETERNIA_STATS") != nullptr);
+    // Page geometry is tunable from the environment, as it is in the GROMACS
+    // hook, because the defaults give a resident cache far LARGER than any
+    // weight matrix a test model has. Without a way to shrink it, an in-model
+    // run cannot show the paged path working under real pressure -- which is
+    // the only condition under which the eviction and writeback paths are
+    // exercised at all.
+    if (const char* e = std::getenv("LBANN_ETERNIA_PAGE_KB")) {
+      cfg.page_bytes = static_cast<std::uint64_t>(std::atoi(e)) * 1024;
+    }
+    if (const char* e = std::getenv("LBANN_ETERNIA_BLOCKS")) {
+      cfg.nblocks = static_cast<std::uint32_t>(std::atoi(e));
+    }
+    if (const char* e = std::getenv("LBANN_ETERNIA_SLOTS")) {
+      cfg.slots = static_cast<std::uint32_t>(std::atoi(e));
+    }
     ctx = eternia_lbann::Create(cfg, h, w);
     if (ctx == nullptr) {
       LBANN_WARNING("eternia: ", eternia_lbann::LastError(), "; using El::Gemm");
