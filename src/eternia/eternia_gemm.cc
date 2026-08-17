@@ -113,6 +113,69 @@ __device__ gy::YCoroMain GemmCoro(gv::DeviceVector<float> W, const float* X,
   co_return;
 }
 
+/**
+ * dX = W_row^T * dC for this block's page-aligned slice of W.
+ *
+ * The same page walk as GemmCoro. The difference is the accumulation target:
+ * a page of W holds whole ROWS i, and each element W[i*k + j] contributes to
+ * dX(j, c) for every column c -- so a block contributes to many rows of dX
+ * rather than owning a few, and the adds are cross-block.
+ */
+__device__ gy::YCoroMain BackwardCoro(gv::DeviceVector<float> W,
+                                      const float* dC, int ldc, float* dX,
+                                      int ldx, u64 m, u64 k, u64 n,
+                                      const u64* elem_lo, const u64* elem_hi,
+                                      u32 block)
+{
+  u64 run = 0;
+  const u64 e0 = elem_lo[block], e1 = elem_hi[block];
+  const u64 pe = W.h_->elems_per_page_;
+
+  // Same reason as the forward: the host rewrites W between calls and nothing
+  // invalidates resident pages.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    W.DropAll();
+  }
+  __syncthreads();
+
+  for (u64 off = e0; off < e1;) {
+    const u64 seg_end = ((off / pe) + 1) * pe < e1 ? ((off / pe) + 1) * pe : e1;
+    co_await W.HoldPageCoro(off, seg_end - off, &run);
+
+    // One thread per (element of W, column of dC). Each W element is read
+    // once and fans out across the mini-batch, which is what keeps the page
+    // resident for the whole of its useful life.
+    for (u64 t = threadIdx.x; t < (seg_end - off) * n; t += blockDim.x) {
+      const u64 e = off + t / n;      // element of W
+      const u64 c = t % n;            // column
+      const u64 i = e / k;            // row of W  == row of dC
+      const u64 j = e - i * k;        // column of W == row of dX
+      const float w = W.at(e);
+      if (w != 0.0f) {
+        atomicAdd(&dX[c * ldx + j], w * dC[c * ldc + i]);
+      }
+    }
+    __syncthreads();
+    off = seg_end;
+  }
+  co_return;
+}
+
+__global__ void BackwardKernel(clio::run::IpcManagerGpuInfo info,
+                               gv::DeviceVector<float> W, const float* dC,
+                               int ldc, float* dX, int ldx, u64 m, u64 k, u64 n,
+                               const u64* elem_lo, const u64* elem_hi,
+                               gy::YieldableView<> yv, gy::YieldStackView ys)
+{
+  CLIO_GPU_INIT(info, nullptr);
+  W.block_override_ = yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(BackwardCoro(W, dC, ldc, dX, ldx, m, k, n, elem_lo, elem_hi,
+                              yv.Block()));
+}
+
 __global__ void GemmKernel(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<float> W, const float* X, int ldx,
                            float* C, int ldc, u64 m, u64 k, u64 n,
@@ -329,6 +392,42 @@ bool Forward(Context* ctx, const float* x_device, int ldx, int n,
 #endif
 }
 
+bool BackwardInput(Context* ctx, const float* dc_device, int ldc, int n,
+                   float* dx_device, int ldx)
+{
+#if !defined(ETERNIA_LBANN_CORO)
+  (void)ctx; (void)dc_device; (void)ldc; (void)n; (void)dx_device; (void)ldx;
+  SetErr("built without the paged backend");
+  return false;
+#else
+  if (!ctx || !dc_device || !dx_device) {
+    SetErr("BackwardInput: null argument");
+    return false;
+  }
+  auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(ctx->cfg.gpu_id);
+  // dX is accumulated into, so it starts at zero.
+  cudaMemset2D(dx_device, static_cast<size_t>(ldx) * sizeof(float), 0,
+               ctx->k * sizeof(float), static_cast<size_t>(n));
+
+  auto dW = ctx->W->GetDevice(ctx->cfg.gpu_id);
+  YieldRunner runner(ctx->cfg.nblocks, ctx->cfg.nthreads);
+  const u32 rounds = runner.Run(
+    [&](dim3 g, dim3 b, gy::YieldableView<> v, gy::YieldStackView sv) {
+      BackwardKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+        gpu, dW, dc_device, ldc, dx_device, ldx, ctx->m, ctx->k,
+        static_cast<u64>(n), ctx->d_lo, ctx->d_hi, v, sv);
+    });
+  const cudaError_t le = cudaGetLastError();
+  if (le != cudaSuccess) { SetErr(cudaGetErrorString(le)); return false; }
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    SetErr(cudaGetErrorString(cudaGetLastError()));
+    return false;
+  }
+  if (rounds == 0) { SetErr("yield driver made no progress"); return false; }
+  return true;
+#endif
+}
+
 Stats GetStats(Context* ctx) { return ctx ? ctx->stats : Stats(); }
 
 #endif  // !CTP_IS_DEVICE_PASS
@@ -348,6 +447,7 @@ Context* Create(const Config&, int, int) { return nullptr; }
 void Destroy(Context*) {}
 bool UploadWeights(Context*, const float*, int) { return false; }
 bool Forward(Context*, const float*, int, int, float*, int) { return false; }
+bool BackwardInput(Context*, const float*, int, int, float*, int) { return false; }
 Stats GetStats(Context*) { return Stats(); }
 }  // namespace eternia_lbann
 

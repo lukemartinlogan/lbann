@@ -167,9 +167,18 @@ El::Gemm with the host weights and the GPU error signals. Training a layer
 wider than VRAM therefore needs three more pieces, all of which this branch
 has scoped but not built:
 
-1. `dL/dX = W * dL/dY` -- the same shape of operation as the forward, but it
-   needs W rather than W-transpose, so it is a second kernel variant rather
-   than a reuse.
+1. ~~`dL/dX = W * dL/dY`~~ -- **done**. `BackwardInput` walks the same pages
+   of W as the forward and differs only in which index it accumulates into:
+
+       forward   C[c*ldc + i]  = sum_j W[i*k + j] * X [c*ldx + j]
+       backward  dX[c*ldx + j] = sum_i W[i*k + j] * dC[c*ldc + i]
+
+   A page of W holds whole ROWS, so a block contributes to many rows of dX
+   rather than owning a few, and the accumulation is a cross-block atomicAdd
+   -- safe because dX is resident and only k*n. Validated against an
+   independent host reference across the same paging sweep as the forward,
+   at 4e-07 relative or better, including with 80 of 128 pages evicted.
+
 2. `dL/dW = X * dL/dY^T` -- produces a matrix the size of W, so the GRADIENT
    has to be paged too, not just the weights.
 3. The optimizer update over paged W and paged dW, page by page.

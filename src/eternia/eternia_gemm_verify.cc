@@ -128,6 +128,50 @@ int main(int argc, char** argv)
   std::vector<float> got(static_cast<size_t>(m) * n);
   cudaMemcpy(got.data(), dC, got.size() * sizeof(float), cudaMemcpyDeviceToHost);
 
+  // ---- backward: dX = W * dC, against an independent host reference ----
+  // Checked separately from the forward because it is a DIFFERENT kernel with
+  // a different accumulation pattern (cross-block atomicAdd into dX), not a
+  // reuse of the forward one.
+  std::vector<float> hdC(static_cast<size_t>(m) * n);
+  {
+    unsigned s2 = 31337u;
+    auto rnd = [&]() {
+      s2 = s2 * 1664525u + 1013904223u;
+      return static_cast<float>(s2 >> 8) / static_cast<float>(1u << 24) * 2.0f - 1.0f;
+    };
+    for (auto& v : hdC) v = rnd();
+  }
+  std::vector<double> refdX(static_cast<size_t>(k) * n, 0.0);
+  for (int j = 0; j < k; ++j) {
+    for (int c = 0; c < n; ++c) {
+      double acc = 0.0;
+      for (int i = 0; i < m; ++i) {
+        // W_row(i, j) is Hydrogen's W(j, i) = W[i*h + j]
+        acc += static_cast<double>(W[static_cast<size_t>(i) * h + j]) *
+               static_cast<double>(hdC[static_cast<size_t>(c) * m + i]);
+      }
+      refdX[static_cast<size_t>(c) * k + j] = acc;
+    }
+  }
+  float *dDC = nullptr, *dDX = nullptr;
+  cudaMalloc(&dDC, hdC.size() * sizeof(float));
+  cudaMalloc(&dDX, static_cast<size_t>(k) * n * sizeof(float));
+  cudaMemcpy(dDC, hdC.data(), hdC.size() * sizeof(float), cudaMemcpyHostToDevice);
+  double bmax = 0.0, bpeak = 0.0;
+  if (!eternia_lbann::BackwardInput(ctx, dDC, m, n, dDX, k)) {
+    std::fprintf(stderr, "BackwardInput failed: %s\n", eternia_lbann::LastError());
+    return 1;
+  }
+  {
+    std::vector<float> gotdX(static_cast<size_t>(k) * n);
+    cudaMemcpy(gotdX.data(), dDX, gotdX.size() * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    for (size_t q = 0; q < gotdX.size(); ++q) {
+      bpeak = std::max(bpeak, std::fabs(refdX[q]));
+      bmax = std::max(bmax, std::fabs(refdX[q] - static_cast<double>(gotdX[q])));
+    }
+  }
+
   const auto st = eternia_lbann::GetStats(ctx);
   double maxd = 0.0, peak = 0.0;
   for (size_t i = 0; i < got.size(); ++i) {
@@ -137,15 +181,17 @@ int main(int argc, char** argv)
   // The accumulation is a sum of k single-precision products, so the
   // tolerance scales with sqrt(k) as well as with the magnitude present.
   const double tol = 1e-5 * std::max(peak, 1.0) * std::sqrt(static_cast<double>(k));
-  const bool ok = (maxd <= tol) && (st.get_errors == 0);
+  const double btol = 1e-5 * std::max(bpeak, 1.0) * std::sqrt(static_cast<double>(m));
+  const bool ok = (maxd <= tol) && (bmax <= btol) && (st.get_errors == 0);
 
   std::printf("W=%dx%d (W^T = %dx%d)  X=%dx%d  page=%lluKB blocks=%u slots=%u\n"
               "  faults=%llu evicts=%llu get_errors=%llu\n"
-              "  max|diff|=%.4e peak=%.4e tol=%.4e\n%s\n",
+              "  fwd max|diff|=%.4e peak=%.4e tol=%.4e\n"
+              "  bwd max|diff|=%.4e peak=%.4e tol=%.4e\n%s\n",
               h, w, m, k, k, n, (unsigned long long)page_kb, blocks, slots,
               (unsigned long long)st.faults, (unsigned long long)st.evicts,
               (unsigned long long)st.get_errors, maxd, peak, tol,
-              ok ? "PASS" : "FAIL");
+              bmax, bpeak, btol, ok ? "PASS" : "FAIL");
   eternia_lbann::Destroy(ctx);
   return ok ? 0 : 1;
 }

@@ -107,6 +107,31 @@ bool UploadWeights(Context* ctx, const float* w_colmajor, int ldim);
 bool Forward(Context* ctx, const float* x_device, int ldx, int n,
              float* c_device, int ldc);
 
+/**
+ * dX = W * dC, the gradient with respect to the layer INPUT.
+ *
+ * Forward is C(m,n) = W_row(m,k) * X(k,n); this is its transpose-multiply
+ * partner, dX(k,n) = W_row^T * dC(m,n), so it walks the same pages of W and
+ * differs only in which index it accumulates into:
+ *
+ *     forward   C[c*ldc + i] = sum_j W[i*k + j] * X [c*ldx + j]
+ *     backward  dX[c*ldx + j] = sum_i W[i*k + j] * dC[c*ldc + i]
+ *
+ * A block owning a page of W therefore contributes to MANY rows of dX rather
+ * than owning a few, so the accumulation is a cross-block atomicAdd. That is
+ * safe because dX is resident and k*n, not paged.
+ *
+ * This exists because keeping the weights off the GPU is not enough on its
+ * own: backpropagation also multiplies by W, and with the weights in host
+ * memory El::Gemm refuses ("Must call gemm with matrices on same device").
+ *
+ * @param dc_device  dC (m x n) column-major on the device, leading dim ldc
+ * @param dx_device  dX (k x n) column-major on the device, leading dim ldx;
+ *                   ZEROED by this call before accumulating
+ */
+bool BackwardInput(Context* ctx, const float* dc_device, int ldc, int n,
+                   float* dx_device, int ldx);
+
 Stats GetStats(Context* ctx);
 
 /** Never null. */
