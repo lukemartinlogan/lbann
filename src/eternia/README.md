@@ -431,6 +431,37 @@ size is a few multiples of the page cache, not a fixed fraction of the GPU.
 The cost remains time: 138 s against 4.4 s at 1 GiB, with a page cache 1/128
 the size of the matrix. This buys capacity, not speed.
 
+**And it costs host memory -- about 9.5x the weight matrix.** This is the
+largest unaddressed problem in the integration, and it was not measured until
+after the VRAM result above was written, which is the wrong order.
+
+Peak RSS (`/usr/bin/time -v`), same runs:
+
+| fc1 weights | stock RSS | paged RSS | (paged - baseline) / W |
+|-------------|-----------|-----------|------------------------|
+| 2 MiB       | 612 MB    | 1951 MB   | -- (baseline) |
+| 64 MiB      | 688 MB    | 2654 MB   | 11.0x |
+| 256 MiB     | --        | 4353 MB   | 9.4x  |
+| 1 GiB       | 1671 MB   | 11697 MB  | 9.5x  |
+
+So the VRAM saving is bought with host memory at roughly ten times the size of
+what was moved off the GPU. At 1 GiB of weights that is 11.7 GB of RSS; a model
+with 10 GiB of weights would want ~100 GB, which is a hard ceiling on the
+approach as it stands.
+
+It is NOT the known per-fault SHM segment growth. Holding the weights fixed at
+64 MiB and varying the page size 32 KB -> 256 KB cuts faults 8x (8192 -> 1024)
+and moves RSS by 1% (2654 -> 2624 MB). The amplification tracks DATA, not
+paging activity.
+
+Where it comes from is not yet localised. Four copies are accounted for by
+design -- W and dW as CTE blobs, LBANN's host copy of the linearity, and the
+CPU gradient buffer -- which leaves roughly half unexplained. Candidates are
+the replication module composed in `clio.yaml` (`async write-through sweep every
+50 ms`), staging buffers on the put path, and SHM heap sizing. That is the next
+thing to measure, and it should be measured before this integration is
+described as saving memory anywhere but on the GPU.
+
 ### Larger than VRAM (the kernel, driven directly)
 
 On an 8 GiB (7.99 GiB usable) RTX 4070 Laptop:
