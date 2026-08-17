@@ -454,13 +454,37 @@ It is NOT the known per-fault SHM segment growth. Holding the weights fixed at
 and moves RSS by 1% (2654 -> 2624 MB). The amplification tracks DATA, not
 paging activity.
 
-Where it comes from is not yet localised. Four copies are accounted for by
-design -- W and dW as CTE blobs, LBANN's host copy of the linearity, and the
-CPU gradient buffer -- which leaves roughly half unexplained. Candidates are
-the replication module composed in `clio.yaml` (`async write-through sweep every
-50 ms`), staging buffers on the put path, and SHM heap sizing. That is the next
-thing to measure, and it should be measured before this integration is
-described as saving memory anywhere but on the GPU.
+Partially localised, by reading `/proc/<pid>/smaps` at peak (the mapping totals
+reconcile with `VmRSS`, 4033 MB against 4020 MB, so the breakdown is the whole
+of RSS and not a sample of it). At 256 MiB of weights:
+
+| mapping | RSS |
+|---------|-----|
+| `[anon rw]` | 2209 MB |
+| `memfd:clio_rambdev` | 769 MB |
+| `/dev/zero (deleted)` | 376 MB |
+| `memfd:chi_metadata_segment` | 299 MB |
+
+Three things are now ruled out, each by measurement rather than reasoning:
+
+- **Not the config.** The CTE `ram` tier's `capacity_limit` (1024 / 4096 / 8192
+  MB) and the `clio_bdev` pool's `capacity` (256MB / 1GB / 4GB) each move peak
+  RSS by less than 0.1%. Unlike the `hbm` tier, neither is preallocated.
+- **Not paging activity.** 8x fewer faults at fixed weights moves RSS 1%.
+- **Not an unbounded leak.** The RAM bdev grows 582 -> 768 MB from one epoch to
+  two and then stops: 768 MB at both 2 and 4 epochs. It reaches a steady state
+  after the first optimizer step rather than accumulating per step.
+
+What is left is a steady state that is simply larger than the data: the RAM
+bdev holds **3x W** where only W and dW exist as blobs, i.e. one whole extra
+copy of the weight matrix beyond the two the design calls for. Finding what
+that third copy is -- a retained prior version, a write-through replica, or
+allocator slack that never reclaims -- is the next concrete step, and it is
+worth roughly a third of the amplification.
+
+The remaining growth is in anonymous mappings. LBANN's own host copy of the
+linearity and its CPU gradient buffer account for 2x W of that by design; the
+rest is not yet attributed.
 
 ### Larger than VRAM (the kernel, driven directly)
 
