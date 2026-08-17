@@ -18,6 +18,12 @@
 # produced, which loses unflushed stderr; run under gdb to see the check
 # output reliably.
 set -e
+# A correctly sized Clio config ships next to this script. Defaulting to it
+# matters more than it looks: the hbm tier's capacity_limit is preallocated on
+# the GPU, so borrowing a config with a large tier makes the paged path appear
+# to cost far more memory than it saves.
+: "${CLIO_SERVER_CONF:=$(cd "$(dirname "$0")" && pwd)/clio.yaml}"
+export CLIO_SERVER_CONF
 : "${LBANN:?set LBANN to the lbann binary}"
 P="$(dirname "$0")/mlp.prototext"
 
