@@ -108,6 +108,42 @@ throughout, against a GPU-side cache of `blocks * slots * page` = 64 * 8 *
 256 KB = 128 MB, about 1.25% of the matrix, and reproduces the expected
 result exactly.
 
+## Validated through the LBANN boundary
+
+`lbann_eternia_gemm_verify` exercises eternia_gemm.h with the SAME layouts
+the fully-connected layer passes -- W column-major on the host, X and C
+column-major on the device, computing C = W^T * X -- against an independent
+host reference. That matters separately from the standalone bench: the bench
+proved the kernel, but the integration adds a LAYOUT CONTRACT (Hydrogen's
+column-major buffer reinterpreted as the kernel's row-major weight matrix),
+and a layout contract is exactly the sort of thing that is plausible on paper
+and wrong in practice.
+
+| W          | X      | page  | blocks | slots | max abs diff | faults / evicts |
+|------------|--------|-------|--------|-------|--------------|-----------------|
+| 512 x 256  | 512x8  | 64KB  | 16     | 8     | 9.4e-07      | 8 / 0           |
+| 512 x 256  | 512x8  | 4KB   | 16     | 3     | 9.4e-07      | 128 / 80        |
+| 512 x 256  | 512x8  | 4KB   | 64     | 2     | 9.4e-07      | 128 / 0         |
+| 512 x 256  | 512x8  | 1MB   | 4      | 2     | 9.4e-07      | 1 / 0           |
+| 333 x 177  | 333x5  | 16KB  | 13     | 3     | 8.3e-07      | 15 / 0          |
+| 2048 x 1024| 2048x32| 256KB | 32     | 4     | 1.9e-06      | 32 / 0          |
+
+The 333 x 177 / n=5 / 13-block row is deliberately non-power-of-two, so rows
+straddle page boundaries and blocks own ragged slices.
+
+### Larger than VRAM
+
+On an 8 GiB (7.99 GiB usable) RTX 4070 Laptop:
+
+| W             | elements      | size          | faults / evicts | max abs diff | result |
+|---------------|---------------|---------------|-----------------|--------------|--------|
+| 65536 x 40960 | 2,684,354,560 | **10.00 GiB** | 40,960 / 40,448 | 3.7e-04      | PASS   |
+
+Against a peak of 1.09e+04 that is 3.4e-08 relative -- single-precision
+rounding on a sum of 65536 products. The GPU-side cache is
+`blocks * slots * page` = 64 * 8 * 256 KB = 128 MB, about 1.25% of the
+matrix.
+
 ## Next, and what blocks it
 
 Wire into `src/layers/learning/fully_connected.cpp` behind a runtime switch.

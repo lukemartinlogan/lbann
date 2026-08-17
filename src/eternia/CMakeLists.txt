@@ -98,3 +98,11 @@ target_link_libraries(lbann_eternia PUBLIC
 set_target_properties(lbann_eternia PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
 install(TARGETS lbann_eternia ARCHIVE DESTINATION lib)
 install(FILES eternia_gemm.h DESTINATION include)
+
+# Validation of the boundary as LBANN calls it: Hydrogen layouts, W^T * X,
+# against an independent host reference. Plain C++ -- it links the library and
+# uses only eternia_gemm.h, so it never sees CUDA or Clio headers.
+if (NOT ETERNIA_LIB_ONLY)
+  add_executable(lbann_eternia_gemm_verify eternia_gemm_verify.cc)
+  target_link_libraries(lbann_eternia_gemm_verify PRIVATE lbann_eternia CUDA::cudart)
+endif ()
