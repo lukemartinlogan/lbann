@@ -925,6 +925,61 @@ endif ()
 add_subdirectory(src/drivers)
 
 # Add the rest of the things
+# Eternia paged GEMM: the weight matrix lives in the Clio CTE and is paged
+# into the GPU from inside the kernel, so a layer can be wider than GPU
+# memory. Off by default; the device half needs clang and an iowarp-core
+# install, so it cannot be a hard dependency.
+option(LBANN_WITH_ETERNIA "Enable the Eternia paged forward GEMM" OFF)
+if (LBANN_WITH_ETERNIA)
+  if (NOT iowarp-core_DIR)
+    message(FATAL_ERROR
+      "LBANN_WITH_ETERNIA needs -Diowarp-core_DIR=<clio-install>/lib/cmake/iowarp-core")
+  endif ()
+  # iowarp-core names these in its exported link interfaces without
+  # find_package-ing them, so they must be imported first or the generate
+  # step fails on a missing target.
+  find_package(nvcomp QUIET CONFIG)
+  find_package(yaml-cpp QUIET CONFIG)
+  find_package(cereal QUIET CONFIG)
+  # The cereal package installed here exports the target `cereal`, while
+  # iowarp-core's exported ctp::serialize names `cereal::cereal`. Bridge the
+  # two rather than rebuilding cereal under a different name.
+  if (TARGET cereal AND NOT TARGET cereal::cereal)
+    add_library(cereal::cereal INTERFACE IMPORTED)
+    set_target_properties(cereal::cereal PROPERTIES
+      INTERFACE_LINK_LIBRARIES cereal)
+  endif ()
+  find_package(iowarp-core REQUIRED)
+  include(${CMAKE_CURRENT_SOURCE_DIR}/src/eternia/eternia_lib.cmake)
+  # Link the Clio libraries BY PATH, not through their CMake targets.
+  #
+  # Those targets carry a cxx_std_20 usage requirement, and CMake applies it
+  # to every translation unit of any target that links them -- PRIVATE does
+  # not help, because LBANN's own sources are exactly what gets the flag. The
+  # result is -std=c++17 AND -std=gnu++20 on the same command line, and the
+  # bundled cereal is not C++20-clean: static_object.hpp's LockGuard fails to
+  # compile. A path carries no usage requirements, which is the point.
+  #
+  # The paged GEMM lives entirely inside liblbann_eternia.a; LBANN needs only
+  # the symbols, never the headers or the standard.
+  set(_etn_clio_libs)
+  foreach(_l clio_run_cxx clio_run_cxx_gpu clio_admin_client clio_bdev_client
+             clio_cte_core_client clio_ctp_cuda clio_ctp_host)
+    find_library(_etn_lib_${_l} NAMES ${_l} HINTS ${_etn_clio_prefix}/lib REQUIRED)
+    list(APPEND _etn_clio_libs ${_etn_lib_${_l}})
+  endforeach()
+  # ZeroMQ comes in through Clio's IPC layer. Linking Clio by path means its
+  # own transitive system dependencies are not carried along, so the ones the
+  # archive actually references have to be named.
+  find_library(_etn_zmq NAMES zmq REQUIRED)
+  target_link_libraries(lbann PRIVATE
+    LBANN::eternia ${_etn_clio_libs} ${_etn_zmq} CUDA::cudart)
+  # BUILD_INTERFACE: lbann is an exported target, and a bare source path in
+  # INTERFACE_INCLUDE_DIRECTORIES is not installable.
+  target_include_directories(lbann PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src/eternia)
+  target_compile_definitions(lbann PRIVATE LBANN_HAS_ETERNIA)
+endif ()
+
 add_subdirectory(data_utils)
 add_subdirectory(model_zoo)
 add_subdirectory(model_zoo/tests)

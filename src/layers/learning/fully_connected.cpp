@@ -27,6 +27,11 @@
 #define LBANN_FULLY_CONNECTED_LAYER_INSTANTIATE
 #include "lbann/layers/learning/fully_connected.hpp"
 
+#include "eternia_gemm.h"
+#include <cstdlib>
+#include <iostream>
+#include <type_traits>
+
 #include "lbann/optimizers/optimizer.hpp"
 #include "lbann/weights/initializer.hpp"
 #include "lbann/weights/variance_scaling_initializers.hpp"
@@ -829,9 +834,106 @@ void fully_connected_layer<T, L, D>::write_specific_proto(
   msg->set_transpose(m_transpose);
 }
 
+namespace {
+
+/**
+ * Eternia paged forward GEMM, behind LBANN_ETERNIA_FC.
+ *
+ * Replaces C = W^T * X with a kernel that holds W out of core and pages it
+ * into the GPU on demand, so a layer can be wider than GPU memory.
+ *
+ * Takes primitives rather than the layer: the caller is a member function and
+ * already has access to the private state, and reaching into it from a free
+ * function would need a friend declaration for something that is an
+ * implementation detail.
+ *
+ * @param w_host   W's column-major buffer copied to the host, and its ldim
+ * @param x_dev    X (k x n) column-major on the device, and its ldim
+ * @param c_dev    C (m x n) column-major on the device, and its ldim
+ */
+bool eternia_fc_gemm(eternia_lbann::Context*& ctx, int& cached_h, int& cached_w,
+                     const void* owner, const float* w_host, int w_ldim, int h,
+                     int w, const float* x_dev, int ldx, int n, float* c_dev,
+                     int ldc)
+{
+  if (!eternia_lbann::Available()) return false;
+
+  if (ctx != nullptr && (cached_h != h || cached_w != w)) {
+    eternia_lbann::Destroy(ctx);
+    ctx = nullptr;
+  }
+  if (ctx == nullptr) {
+    eternia_lbann::Config cfg;
+    static std::string tag;
+    tag = "lbann_eternia_fc_" +
+          std::to_string(reinterpret_cast<std::uintptr_t>(owner));
+    cfg.tag = tag.c_str();
+    cfg.stats = (std::getenv("LBANN_ETERNIA_STATS") != nullptr);
+    ctx = eternia_lbann::Create(cfg, h, w);
+    if (ctx == nullptr) {
+      LBANN_WARNING("eternia: ", eternia_lbann::LastError(), "; using El::Gemm");
+      return false;
+    }
+    cached_h = h;
+    cached_w = w;
+  }
+
+  // Re-uploaded every call: nothing invalidates resident pages when the host
+  // rewrites the backing store, the same property the LAMMPS integration has
+  // to drop its caches for each step.
+  if (!eternia_lbann::UploadWeights(ctx, w_host, w_ldim)) {
+    LBANN_WARNING("eternia: ", eternia_lbann::LastError(), "; using El::Gemm");
+    return false;
+  }
+  if (!eternia_lbann::Forward(ctx, x_dev, ldx, n, c_dev, ldc)) {
+    LBANN_WARNING("eternia: ", eternia_lbann::LastError(), "; using El::Gemm");
+    return false;
+  }
+  if (std::getenv("LBANN_ETERNIA_STATS") != nullptr) {
+    const auto st = eternia_lbann::GetStats(ctx);
+    std::cerr << "[eternia] faults=" << st.faults << " evicts=" << st.evicts
+              << " get_errors=" << st.get_errors << std::endl;
+  }
+  return true;
+}
+
+}  // namespace
+
 template <typename TensorDataType, data_layout T_layout, El::Device Dev>
 void fully_connected_layer<TensorDataType, T_layout, Dev>::fp_compute()
 {
+  // The paged path applies only when every one of these holds; anything else
+  // falls through to El::Gemm.
+  //   - LBANN_ETERNIA_FC is set
+  //   - float32 on the GPU
+  //   - m_transpose, so the GEMM is W^T * X and Hydrogen's column-major
+  //     buffer already IS the row-major matrix the kernel reads
+  //   - no bias term, which the paged path does not apply
+  //   - the matrices are local
+  static const bool want = (std::getenv("LBANN_ETERNIA_FC") != nullptr);
+  if (want && Dev == El::Device::GPU &&
+      std::is_same<TensorDataType, float>::value && this->m_transpose &&
+      this->m_bias_scaling_factor == El::TypeTraits<TensorDataType>::Zero()) {
+    const auto& linearity = this->weights_values(0);
+    if (linearity.Participating() && linearity.DistSize() == 1) {
+      const auto& lin = linearity.LockedMatrix();
+      const auto& in = this->get_local_prev_activations();
+      auto& out = this->get_local_activations();
+      if (in.Width() > 0 && out.Width() > 0) {
+        // The uploader reads host memory; Hydrogen keeps the weights on GPU.
+        El::Matrix<TensorDataType, El::Device::CPU> host_lin;
+        El::Copy(lin, host_lin);
+        if (eternia_fc_gemm(
+              m_eternia_ctx, m_eternia_h, m_eternia_w, this,
+              reinterpret_cast<const float*>(host_lin.LockedBuffer()),
+              host_lin.LDim(), lin.Height(), lin.Width(),
+              reinterpret_cast<const float*>(in.LockedBuffer()), in.LDim(),
+              in.Width(), reinterpret_cast<float*>(out.Buffer()), out.LDim())) {
+          return;
+        }
+      }
+    }
+  }
   fp_compute_impl<TensorDataType>(*this);
 }
 

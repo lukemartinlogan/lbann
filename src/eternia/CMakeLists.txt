@@ -35,6 +35,13 @@ endif()
 # fails on a missing target. Same workaround as the LAMMPS lib/eternia build.
 find_package(nvcomp QUIET CONFIG)
 find_package(yaml-cpp QUIET CONFIG)
+find_package(cereal QUIET CONFIG)
+# The cereal package installed for LBANN exports the target `cereal`, while
+# iowarp-core's exported ctp::serialize names `cereal::cereal`.
+if (TARGET cereal AND NOT TARGET cereal::cereal)
+  add_library(cereal::cereal INTERFACE IMPORTED)
+  set_target_properties(cereal::cereal PROPERTIES INTERFACE_LINK_LIBRARIES cereal)
+endif ()
 find_package(Threads QUIET)
 find_package(iowarp-core REQUIRED)
 find_package(CUDAToolkit REQUIRED)
@@ -70,3 +77,24 @@ target_link_libraries(lbann_eternia_gemm_bench PRIVATE
 # choice for the same reason.
 set_target_properties(lbann_eternia_gemm_bench PROPERTIES
     CUDA_SEPARABLE_COMPILATION OFF)
+
+# ---------------------------------------------------------------------------
+# The library half, for linking into LBANN. ETERNIA_LIB_ONLY skips the
+# standalone bench so the ExternalProject build stays small.
+# ---------------------------------------------------------------------------
+option(ETERNIA_LIB_ONLY "Build only the paged-GEMM library" OFF)
+
+set_source_files_properties(eternia_gemm.cc PROPERTIES LANGUAGE CUDA)
+add_library(lbann_eternia STATIC eternia_gemm.cc)
+target_compile_definitions(lbann_eternia PRIVATE ETERNIA_LBANN_ENABLED CLIO_YIELD_CORO)
+target_include_directories(lbann_eternia PUBLIC
+    ${CMAKE_CURRENT_SOURCE_DIR} ${IOWARP_CORE_INCLUDE_DIR})
+target_link_libraries(lbann_eternia PUBLIC
+    clio::run::cxx clio::run::clio_run_cxx_gpu clio::run::admin_client
+    clio::run::bdev_client clio::cte::core_client ctp::cudacxx CUDA::cudart)
+# Separable compilation off: it leaves relocatable device code needing a
+# device link that LBANN's plain link never performs, and under clang-CUDA
+# CMake drives fatbinary with pre-CUDA-13 options.
+set_target_properties(lbann_eternia PROPERTIES CUDA_SEPARABLE_COMPILATION OFF)
+install(TARGETS lbann_eternia ARCHIVE DESTINATION lib)
+install(FILES eternia_gemm.h DESTINATION include)

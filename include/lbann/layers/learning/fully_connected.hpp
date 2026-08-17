@@ -27,6 +27,11 @@
 #ifndef LBANN_LAYERS_LEARNING_FULLY_CONNECTED_HPP_INCLUDED
 #define LBANN_LAYERS_LEARNING_FULLY_CONNECTED_HPP_INCLUDED
 
+// Opaque handle for the Eternia paged forward GEMM (see src/eternia).
+namespace eternia_lbann {
+struct Context;
+}
+
 #include "lbann/layers/data_type_layer.hpp"
 #include "lbann/models/model.hpp"
 
@@ -137,6 +142,14 @@ private:
 
   /** Whether the transpose of the linearity matrix is applied. */
   bool m_transpose;
+
+  /** Eternia paged-GEMM state, null unless LBANN_ETERNIA_FC selected it.
+   *  Public because the free function that drives it lives in the .cpp. */
+public:
+  eternia_lbann::Context* m_eternia_ctx = nullptr;
+  int m_eternia_h = 0;
+  int m_eternia_w = 0;
+
 
   /** Deallocate distributed matrices. */
   void deallocate_matrices()
