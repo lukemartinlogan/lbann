@@ -178,6 +178,25 @@ void fully_connected_layer<TensorDataType, T_layout, Dev>::setup_data(
   else {
     linearity_weights.set_dims(output_dims, input_dims);
   }
+  // LBANN_ETERNIA_FC_HOST_WEIGHTS: keep the linearity OFF the GPU.
+  //
+  // Without this the paged GEMM does not lift anything: LBANN allocates the
+  // weight matrix in VRAM through Hydrogen, and a layer whose weights exceed
+  // VRAM fails in that allocator before the kernel is ever reached (measured:
+  // 32768 x 65536 = 8.00 GiB, "out of memory, 8589934592 requested,
+  // 8032092160 available"). Paging a copy of something already resident saves
+  // nothing.
+  //
+  // DistData carries a device independently of the layer's, so the linearity
+  // can live in host memory while the activations stay on the GPU. The paged
+  // path already reads the weights through the host on its way to the CTE, so
+  // this removes a GPU allocation rather than adding a transfer.
+  //
+  // Off by default: it makes the optimizer update a host matrix, which is
+  // slower for layers that would have fit.
+  if (std::getenv("LBANN_ETERNIA_FC_HOST_WEIGHTS") != nullptr) {
+    linearity_dist.device = El::Device::CPU;
+  }
   linearity_weights.set_matrix_distribution(linearity_dist);
 
   // Set up bias if needed.
@@ -921,6 +940,10 @@ void fully_connected_layer<TensorDataType, T_layout, Dev>::fp_compute()
       const auto& lin = linearity.LockedMatrix();
       const auto& in = this->get_local_prev_activations();
       auto& out = this->get_local_activations();
+      // The weights may be on either device: El::Copy below moves them to the
+      // host either way, and with LBANN_ETERNIA_FC_HOST_WEIGHTS they are
+      // already there. The ACTIVATIONS must be on the GPU -- the kernel reads
+      // and writes them in place.
       if (in.Width() > 0 && out.Width() > 0) {
         // The uploader reads host memory; Hydrogen keeps the weights on GPU.
         El::Matrix<TensorDataType, El::Device::CPU> host_lin;

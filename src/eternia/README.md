@@ -150,10 +150,33 @@ drop-in for the forward GEMM -- exact, including across training -- and as a
 kernel that scales past VRAM when driven directly. It is NOT a way to train a
 layer wider than GPU memory, and nothing here should be read as claiming that.
 
-Getting that would mean the weights LIVING in the CTE rather than being
-copied into it: replacing `weights`' storage, which the optimizer, the
-gradient buffers and checkpointing all touch. That is a much deeper change
-than swapping the GEMM, and it is not attempted here.
+#### How far the host-weights route gets, and where it stops
+
+`LBANN_ETERNIA_FC_HOST_WEIGHTS=1` is a first step at removing that
+allocation. `El::DistData` carries a device independently of the layer's, so
+the linearity can be placed in host memory while the activations stay on the
+GPU; the paged path already reads the weights through the host on their way
+to the CTE, so this removes a GPU allocation rather than adding a transfer.
+
+It is NOT sufficient, and fails loudly rather than silently:
+
+    Must call gemm with matrices on same device.
+
+The forward GEMM is intercepted, but backpropagation is not, and it calls
+El::Gemm with the host weights and the GPU error signals. Training a layer
+wider than VRAM therefore needs three more pieces, all of which this branch
+has scoped but not built:
+
+1. `dL/dX = W * dL/dY` -- the same shape of operation as the forward, but it
+   needs W rather than W-transpose, so it is a second kernel variant rather
+   than a reuse.
+2. `dL/dW = X * dL/dY^T` -- produces a matrix the size of W, so the GRADIENT
+   has to be paged too, not just the weights.
+3. The optimizer update over paged W and paged dW, page by page.
+
+Until those exist the option is experimental: it is left in because it
+establishes that the placement itself works and isolates exactly what
+remains, not because it is usable.
 
 ### Larger than VRAM (the kernel, driven directly)
 
