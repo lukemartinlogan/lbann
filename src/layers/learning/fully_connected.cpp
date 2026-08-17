@@ -858,24 +858,19 @@ void fully_connected_layer<T, L, D>::write_specific_proto(
 namespace {
 
 /**
- * Eternia paged forward GEMM, behind LBANN_ETERNIA_FC.
+ * Create the paged context if needed and push the current weights into it.
  *
- * Replaces C = W^T * X with a kernel that holds W out of core and pages it
- * into the GPU on demand, so a layer can be wider than GPU memory.
+ * Shared by the forward and backward hooks because both need exactly this and
+ * because they must agree on the tag: a second context for the same layer
+ * would page a second, independent copy of W.
  *
- * Takes primitives rather than the layer: the caller is a member function and
- * already has access to the private state, and reaching into it from a free
- * function would need a friend declaration for something that is an
- * implementation detail.
- *
- * @param w_host   W's column-major buffer copied to the host, and its ldim
- * @param x_dev    X (k x n) column-major on the device, and its ldim
- * @param c_dev    C (m x n) column-major on the device, and its ldim
+ * The weights are re-uploaded on every call. Nothing invalidates resident
+ * pages when the host rewrites the backing store -- the same property the
+ * LAMMPS integration has to drop its caches for each step.
  */
-bool eternia_fc_gemm(eternia_lbann::Context*& ctx, int& cached_h, int& cached_w,
-                     const void* owner, const float* w_host, int w_ldim, int h,
-                     int w, const float* x_dev, int ldx, int n, float* c_dev,
-                     int ldc)
+bool eternia_fc_ready(eternia_lbann::Context*& ctx, int& cached_h,
+                      int& cached_w, const void* owner, const float* w_host,
+                      int w_ldim, int h, int w)
 {
   if (!eternia_lbann::Available()) return false;
 
@@ -898,12 +893,34 @@ bool eternia_fc_gemm(eternia_lbann::Context*& ctx, int& cached_h, int& cached_w,
     cached_h = h;
     cached_w = w;
   }
-
-  // Re-uploaded every call: nothing invalidates resident pages when the host
-  // rewrites the backing store, the same property the LAMMPS integration has
-  // to drop its caches for each step.
   if (!eternia_lbann::UploadWeights(ctx, w_host, w_ldim)) {
     LBANN_WARNING("eternia: ", eternia_lbann::LastError(), "; using El::Gemm");
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Eternia paged forward GEMM, behind LBANN_ETERNIA_FC.
+ *
+ * Replaces C = W^T * X with a kernel that holds W out of core and pages it
+ * into the GPU on demand, so a layer can be wider than GPU memory.
+ *
+ * Takes primitives rather than the layer: the caller is a member function and
+ * already has access to the private state, and reaching into it from a free
+ * function would need a friend declaration for something that is an
+ * implementation detail.
+ *
+ * @param w_host   W's column-major buffer copied to the host, and its ldim
+ * @param x_dev    X (k x n) column-major on the device, and its ldim
+ * @param c_dev    C (m x n) column-major on the device, and its ldim
+ */
+bool eternia_fc_gemm(eternia_lbann::Context*& ctx, int& cached_h, int& cached_w,
+                     const void* owner, const float* w_host, int w_ldim, int h,
+                     int w, const float* x_dev, int ldx, int n, float* c_dev,
+                     int ldc)
+{
+  if (!eternia_fc_ready(ctx, cached_h, cached_w, owner, w_host, w_ldim, h, w)) {
     return false;
   }
   if (!eternia_lbann::Forward(ctx, x_dev, ldx, n, c_dev, ldc)) {
@@ -914,6 +931,58 @@ bool eternia_fc_gemm(eternia_lbann::Context*& ctx, int& cached_h, int& cached_w,
     const auto st = eternia_lbann::GetStats(ctx);
     std::cerr << "[eternia] faults=" << st.faults << " evicts=" << st.evicts
               << " get_errors=" << st.get_errors << std::endl;
+  }
+  return true;
+}
+
+
+/**
+ * Eternia paged backward pass: the gradient w.r.t. the input, and the gradient
+ * w.r.t. the weights.
+ *
+ * This is what the forward hook alone could not deliver. Keeping W off the GPU
+ * is not enough on its own, because backpropagation multiplies by W too, and
+ * with the weights in host memory El::Gemm refuses outright:
+ *
+ *     "Must call gemm with matrices on same device"
+ *
+ * so LBANN_ETERNIA_FC_HOST_WEIGHTS could reach the end of a forward pass and
+ * no further.
+ *
+ * @param dw_host  receives dL/dW as Hydrogen lays out the linearity --
+ *                 column-major (h x w) -- for the caller to fold into the
+ *                 optimizer's gradient buffer with its own scales.
+ *
+ * WHAT THIS DOES NOT DO
+ * ---------------------
+ * It does not reduce the memory LBANN itself holds. The optimizer allocates a
+ * full-size resident gradient buffer for the linearity regardless of what this
+ * layer does, so the gradient makes a round trip through host memory here
+ * instead of staying paged. The paged SgdUpdate kernel is what avoids that,
+ * and it does so by bypassing LBANN's optimizer rather than feeding it.
+ */
+bool eternia_fc_bp(eternia_lbann::Context*& ctx, int& cached_h, int& cached_w,
+                   const void* owner, const float* w_host, int w_ldim, int h,
+                   int w, const float* dc_dev, int ldc, int n,
+                   const float* x_dev, int ldx, float* dx_dev, int ldx_out,
+                   float* dw_host, int dw_ldim)
+{
+  if (!eternia_fc_ready(ctx, cached_h, cached_w, owner, w_host, w_ldim, h, w)) {
+    return false;
+  }
+  if (!eternia_lbann::BackwardInput(ctx, dc_dev, ldc, n, dx_dev, ldx_out)) {
+    LBANN_WARNING("eternia: ", eternia_lbann::LastError(), "; using El::Gemm");
+    return false;
+  }
+  if (dw_host != nullptr) {
+    if (!eternia_lbann::WeightGradient(ctx, dc_dev, ldc, n, x_dev, ldx)) {
+      LBANN_WARNING("eternia: ", eternia_lbann::LastError(), "; using El::Gemm");
+      return false;
+    }
+    if (!eternia_lbann::ReadWeightGradient(ctx, dw_host, dw_ldim)) {
+      LBANN_WARNING("eternia: ", eternia_lbann::LastError(), "; using El::Gemm");
+      return false;
+    }
   }
   return true;
 }
@@ -997,6 +1066,133 @@ void fully_connected_layer<TensorDataType, T_layout, Dev>::fp_compute()
 template <typename TensorDataType, data_layout T_layout, El::Device Dev>
 void fully_connected_layer<TensorDataType, T_layout, Dev>::bp_compute()
 {
+  // Gated identically to fp_compute -- the two must agree, because a step that
+  // pages the forward GEMM and then falls back to El::Gemm for the backward
+  // one is not a configuration anybody wants to reason about, and with the
+  // weights on the host the fallback cannot run at all.
+  static const bool want = (std::getenv("LBANN_ETERNIA_FC") != nullptr);
+  if (want && Dev == El::Device::GPU &&
+      std::is_same<TensorDataType, float>::value && this->m_transpose &&
+      this->m_bias_scaling_factor == El::TypeTraits<TensorDataType>::Zero()) {
+    const auto& linearity = this->weights_values(0);
+    if (linearity.Participating() && linearity.DistSize() == 1) {
+      const auto& lin = linearity.LockedMatrix();
+      const auto& in = this->get_local_prev_activations();
+      const auto& dout = this->get_local_prev_error_signals();
+      auto& din = this->get_local_error_signals();
+      if (in.Width() > 0 && dout.Width() > 0 && din.Width() > 0) {
+        El::Matrix<TensorDataType, El::Device::CPU> host_lin;
+        El::Copy(lin, host_lin);
+
+        auto* opt = this->get_weights(0).get_optimizer();
+        TensorDataType dst_scale = El::TypeTraits<TensorDataType>::Zero(),
+                       gradient_scale = El::TypeTraits<TensorDataType>::Zero();
+        El::Matrix<TensorDataType, El::Device::CPU> host_dw;
+        if (opt != nullptr) {
+          host_dw.Resize(lin.Height(), lin.Width());
+        }
+
+        // LBANN_ETERNIA_CHECK: the same two products via El::Gemm, compared
+        // elementwise. The forward hook measures only the forward GEMM, and
+        // the backward pass is two different kernels with two different
+        // accumulation patterns, so it needs its own check rather than
+        // inheriting confidence from the forward one.
+        static const bool check = (std::getenv("LBANN_ETERNIA_CHECK") != nullptr);
+        El::Matrix<TensorDataType, El::Device::GPU> ref_din, ref_dw;
+        if (check) {
+          ref_din.Resize(din.Height(), din.Width());
+          El::Gemm(El::NORMAL,
+                   El::NORMAL,
+                   El::TypeTraits<TensorDataType>::One(),
+                   lin,
+                   dout,
+                   El::TypeTraits<TensorDataType>::Zero(),
+                   ref_din);
+          ref_dw.Resize(lin.Height(), lin.Width());
+          El::Gemm(El::NORMAL,
+                   El::TRANSPOSE,
+                   El::TypeTraits<TensorDataType>::One(),
+                   in,
+                   dout,
+                   El::TypeTraits<TensorDataType>::Zero(),
+                   ref_dw);
+        }
+
+        if (eternia_fc_bp(
+              m_eternia_ctx, m_eternia_h, m_eternia_w, this,
+              reinterpret_cast<const float*>(host_lin.LockedBuffer()),
+              host_lin.LDim(), lin.Height(), lin.Width(),
+              reinterpret_cast<const float*>(dout.LockedBuffer()), dout.LDim(),
+              dout.Width(),
+              reinterpret_cast<const float*>(in.LockedBuffer()), in.LDim(),
+              reinterpret_cast<float*>(din.Buffer()), din.LDim(),
+              opt != nullptr ? reinterpret_cast<float*>(host_dw.Buffer())
+                             : nullptr,
+              opt != nullptr ? host_dw.LDim() : 0)) {
+          if (opt != nullptr) {
+            // The optimizer owns a resident full-size gradient buffer and its
+            // own accumulation scales, so the paged gradient is folded in
+            // rather than handed over.
+            //
+            // The buffer's device follows the WEIGHTS, not the activations:
+            // under LBANN_ETERNIA_FC_HOST_WEIGHTS the linearity is on the
+            // host, so this buffer is a CPU matrix even though everything
+            // else in this function is on the GPU. Branching on it is the
+            // whole point of the option -- assuming GPU here is what made the
+            // host-weights path abort with "Axpy: Incompatible devices!".
+            auto& gbuf =
+              opt->get_gradient_buffer(dst_scale, gradient_scale, true);
+            El::Scale(dst_scale, gbuf.Matrix());
+            if (gbuf.Matrix().GetDevice() == El::Device::CPU) {
+              El::Axpy(
+                gradient_scale,
+                host_dw,
+                static_cast<El::Matrix<TensorDataType, El::Device::CPU>&>(
+                  gbuf.Matrix()));
+            }
+            else {
+              El::Matrix<TensorDataType, El::Device::GPU> dev_dw;
+              El::Copy(host_dw, dev_dw);
+              El::Axpy(
+                gradient_scale,
+                dev_dw,
+                static_cast<El::Matrix<TensorDataType, El::Device::GPU>&>(
+                  gbuf.Matrix()));
+            }
+          }
+          if (check) {
+            auto report = [](const char* what,
+                             const El::Matrix<TensorDataType, El::Device::GPU>& g,
+                             const El::Matrix<TensorDataType, El::Device::GPU>& r) {
+              El::Matrix<TensorDataType, El::Device::CPU> a, b;
+              El::Copy(g, a);
+              El::Copy(r, b);
+              double maxd = 0.0, peak = 0.0;
+              for (El::Int j = 0; j < a.Width(); ++j) {
+                for (El::Int i = 0; i < a.Height(); ++i) {
+                  const double x = a(i, j), y = b(i, j);
+                  peak = std::max(peak, std::abs(y));
+                  maxd = std::max(maxd, std::abs(x - y));
+                }
+              }
+              std::cerr << "[eternia-check] " << what << " " << a.Height() << "x"
+                        << a.Width() << " max|diff|=" << maxd
+                        << " peak=" << peak
+                        << " rel=" << (peak > 0 ? maxd / peak : 0.0)
+                        << std::endl;
+            };
+            report("bp-input", din, ref_din);
+            if (opt != nullptr) {
+              El::Matrix<TensorDataType, El::Device::GPU> got_dw;
+              El::Copy(host_dw, got_dw);
+              report("bp-weights", got_dw, ref_dw);
+            }
+          }
+          return;
+        }
+      }
+    }
+  }
   bp_compute_impl<TensorDataType>(*this);
 }
 

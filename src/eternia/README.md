@@ -237,11 +237,46 @@ The tightest configuration in the sweep is `--slots 2`: the update kernel
 holds a page from each of two vectors, and two slots per vector is the least
 that can serve it.
 
-All four pieces of an out-of-core training step now exist and are validated at
-the boundary. What is NOT yet done is driving them from LBANN's own
-`bp_compute`: only the forward GEMM is wired into the layer, so
-`LBANN_ETERNIA_FC_HOST_WEIGHTS` still fails inside backprop. The remaining
-work is wiring, not kernels.
+In the model
+------------
+
+`bp_compute` is now hooked the same way `fp_compute` is, gated identically --
+the two must agree, because a step that pages the forward GEMM and then falls
+back to `El::Gemm` for the backward one cannot run at all once the weights are
+on the host.
+
+`LBANN_ETERNIA_FC_HOST_WEIGHTS` consequently trains end to end, with the
+linearity never resident on the GPU. Over three epochs of the test model the
+objective is IDENTICAL to the stock path:
+
+| run                       | epoch 1 | epoch 2 | epoch 3 |
+|---------------------------|---------|---------|---------|
+| `El::Gemm` (stock)        | 1.93652 | 1.87546 | 1.87988 |
+| eternia paged fwd + bwd   | 1.93652 | 1.87546 | 1.87988 |
+| eternia + host weights    | 1.93652 | 1.87546 | 1.87988 |
+
+`LBANN_ETERNIA_CHECK=1` recomputes both backward products with `El::Gemm` and
+reports the largest elementwise difference per call: `bp-weights` peaks at
+2.5e-07 relative, and `bp-input` matches bitwise -- believable here only
+because the test model's inner dimension is 4 and 32, where the standalone
+test's 256-deep sums show the expected 4e-07.
+
+Two things this does NOT do
+---------------------------
+
+**It does not reduce the memory LBANN holds.** The optimizer allocates a
+resident, full-size gradient buffer for the linearity whatever the layer does,
+so the gradient makes a round trip through host memory in `bp_compute` rather
+than staying paged. `SgdUpdate` is what avoids that, and it does so by
+bypassing LBANN's optimizer rather than feeding it. Wiring the paged optimizer
+in properly means replacing LBANN's optimizer for that weight, which is a
+larger change than a layer hook.
+
+**It does not lift the VRAM ceiling for a whole model.** Measured separately:
+LBANN still OOMs at 8.00 GiB because everything else it allocates is resident.
+What is demonstrated is narrower and worth stating exactly -- one layer's
+weights can be larger than GPU memory and both its forward and backward passes
+still compute the right answer.
 
 ### Larger than VRAM (the kernel, driven directly)
 
