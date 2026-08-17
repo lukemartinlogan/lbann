@@ -869,14 +869,15 @@ namespace {
  * LAMMPS integration has to drop its caches for each step.
  */
 bool eternia_fc_ready(eternia_lbann::Context*& ctx, int& cached_h,
-                      int& cached_w, const void* owner, const float* w_host,
-                      int w_ldim, int h, int w)
+                      int& cached_w, bool& uploaded, const void* owner,
+                      const float* w_host, int w_ldim, int h, int w)
 {
   if (!eternia_lbann::Available()) return false;
 
   if (ctx != nullptr && (cached_h != h || cached_w != w)) {
     eternia_lbann::Destroy(ctx);
     ctx = nullptr;
+    uploaded = false;
   }
   if (ctx == nullptr) {
     eternia_lbann::Config cfg;
@@ -908,10 +909,19 @@ bool eternia_fc_ready(eternia_lbann::Context*& ctx, int& cached_h,
     cached_h = h;
     cached_w = w;
   }
+  // With LBANN_ETERNIA_FC_OWN_WEIGHTS the paged store is the authoritative
+  // copy: SgdUpdate steps it in place and Hydrogen's matrix goes stale
+  // immediately, so re-uploading would overwrite every update with the
+  // pre-training weights and the model would never learn.
+  static const bool own = (std::getenv("LBANN_ETERNIA_FC_OWN_WEIGHTS") != nullptr);
+  if (own && uploaded) {
+    return true;
+  }
   if (!eternia_lbann::UploadWeights(ctx, w_host, w_ldim)) {
     LBANN_WARNING("eternia: ", eternia_lbann::LastError(), "; using El::Gemm");
     return false;
   }
+  uploaded = true;
   return true;
 }
 
@@ -931,11 +941,12 @@ bool eternia_fc_ready(eternia_lbann::Context*& ctx, int& cached_h,
  * @param c_dev    C (m x n) column-major on the device, and its ldim
  */
 bool eternia_fc_gemm(eternia_lbann::Context*& ctx, int& cached_h, int& cached_w,
-                     const void* owner, const float* w_host, int w_ldim, int h,
-                     int w, const float* x_dev, int ldx, int n, float* c_dev,
-                     int ldc)
+                     bool& uploaded, const void* owner, const float* w_host,
+                     int w_ldim, int h, int w, const float* x_dev, int ldx,
+                     int n, float* c_dev, int ldc)
 {
-  if (!eternia_fc_ready(ctx, cached_h, cached_w, owner, w_host, w_ldim, h, w)) {
+  if (!eternia_fc_ready(ctx, cached_h, cached_w, uploaded, owner, w_host,
+                        w_ldim, h, w)) {
     return false;
   }
   if (!eternia_lbann::Forward(ctx, x_dev, ldx, n, c_dev, ldc)) {
@@ -977,12 +988,13 @@ bool eternia_fc_gemm(eternia_lbann::Context*& ctx, int& cached_h, int& cached_w,
  * and it does so by bypassing LBANN's optimizer rather than feeding it.
  */
 bool eternia_fc_bp(eternia_lbann::Context*& ctx, int& cached_h, int& cached_w,
-                   const void* owner, const float* w_host, int w_ldim, int h,
-                   int w, const float* dc_dev, int ldc, int n,
-                   const float* x_dev, int ldx, float* dx_dev, int ldx_out,
-                   float* dw_host, int dw_ldim)
+                   bool& uploaded, const void* owner, const float* w_host,
+                   int w_ldim, int h, int w, const float* dc_dev, int ldc,
+                   int n, const float* x_dev, int ldx, float* dx_dev,
+                   int ldx_out, float* dw_host, int dw_ldim)
 {
-  if (!eternia_fc_ready(ctx, cached_h, cached_w, owner, w_host, w_ldim, h, w)) {
+  if (!eternia_fc_ready(ctx, cached_h, cached_w, uploaded, owner, w_host,
+                        w_ldim, h, w)) {
     return false;
   }
   if (!eternia_lbann::BackwardInput(ctx, dc_dev, ldc, n, dx_dev, ldx_out)) {
@@ -1049,7 +1061,7 @@ void fully_connected_layer<TensorDataType, T_layout, Dev>::fp_compute()
                    ref);
         }
         if (eternia_fc_gemm(
-              m_eternia_ctx, m_eternia_h, m_eternia_w, this,
+              m_eternia_ctx, m_eternia_h, m_eternia_w, m_eternia_uploaded, this,
               reinterpret_cast<const float*>(host_lin.LockedBuffer()),
               host_lin.LDim(), lin.Height(), lin.Width(),
               reinterpret_cast<const float*>(in.LockedBuffer()), in.LDim(),
@@ -1112,7 +1124,13 @@ void fully_connected_layer<TensorDataType, T_layout, Dev>::bp_compute()
         // the backward pass is two different kernels with two different
         // accumulation patterns, so it needs its own check rather than
         // inheriting confidence from the forward one.
-        static const bool check = (std::getenv("LBANN_ETERNIA_CHECK") != nullptr);
+        // In own-weights mode Hydrogen's copy of W is stale after the first
+        // step, so an El::Gemm reference built from it measures the staleness,
+        // not the kernel. The check is suppressed rather than left to print
+        // numbers that look like errors and are not.
+        static const bool check =
+          (std::getenv("LBANN_ETERNIA_CHECK") != nullptr) &&
+          (std::getenv("LBANN_ETERNIA_FC_OWN_WEIGHTS") == nullptr);
         El::Matrix<TensorDataType, El::Device::GPU> ref_din, ref_dw;
         if (check) {
           ref_din.Resize(din.Height(), din.Width());
@@ -1134,7 +1152,7 @@ void fully_connected_layer<TensorDataType, T_layout, Dev>::bp_compute()
         }
 
         if (eternia_fc_bp(
-              m_eternia_ctx, m_eternia_h, m_eternia_w, this,
+              m_eternia_ctx, m_eternia_h, m_eternia_w, m_eternia_uploaded, this,
               reinterpret_cast<const float*>(host_lin.LockedBuffer()),
               host_lin.LDim(), lin.Height(), lin.Width(),
               reinterpret_cast<const float*>(dout.LockedBuffer()), dout.LDim(),
@@ -1144,7 +1162,34 @@ void fully_connected_layer<TensorDataType, T_layout, Dev>::bp_compute()
               opt != nullptr ? reinterpret_cast<float*>(host_dw.Buffer())
                              : nullptr,
               opt != nullptr ? host_dw.LDim() : 0)) {
-          if (opt != nullptr) {
+          static const bool own =
+            (std::getenv("LBANN_ETERNIA_FC_OWN_WEIGHTS") != nullptr);
+          if (own && opt != nullptr) {
+            // The paged store owns the weights: step it in place and leave
+            // LBANN's optimizer nothing to do. This is what removes the
+            // gradient's round trip through host memory -- dW never leaves the
+            // paged vector, and W is never reassembled anywhere.
+            //
+            // The gradient buffer is still ZEROED rather than ignored. LBANN
+            // steps every weight each iteration regardless of what this layer
+            // did, so leaving a stale gradient there would apply it on top of
+            // the update just made. Zeroing makes that step a no-op, which is
+            // only true because this model uses plain SGD with no momentum;
+            // an optimizer with state would need its state suppressed too.
+            auto& gbuf =
+              opt->get_gradient_buffer(dst_scale, gradient_scale, true);
+            El::Zero(gbuf.Matrix());
+            if (std::getenv("LBANN_ETERNIA_STATS") != nullptr) {
+              std::cerr << "[eternia] own-weights step lr="
+                        << opt->get_learning_rate() << std::endl;
+            }
+            if (!eternia_lbann::SgdUpdate(
+                  m_eternia_ctx,
+                  static_cast<float>(opt->get_learning_rate()))) {
+              LBANN_ERROR("eternia: ", eternia_lbann::LastError());
+            }
+          }
+          else if (opt != nullptr) {
             // The optimizer owns a resident full-size gradient buffer and its
             // own accumulation scales, so the paged gradient is folded in
             // rather than handed over.

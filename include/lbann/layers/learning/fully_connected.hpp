@@ -149,6 +149,11 @@ public:
   eternia_lbann::Context* m_eternia_ctx = nullptr;
   int m_eternia_h = 0;
   int m_eternia_w = 0;
+  /** Whether the weights have been pushed to the paged store. Under
+   *  LBANN_ETERNIA_FC_OWN_WEIGHTS they are pushed ONCE and never again: the
+   *  paged copy is then the authoritative one, and re-uploading would undo
+   *  every optimizer step. */
+  bool m_eternia_uploaded = false;
 
 
   /** Deallocate distributed matrices. */

@@ -283,13 +283,54 @@ also puts a 2 MB weight matrix across many pages rather than one or two:
 Two things this does NOT do
 ---------------------------
 
-**It does not reduce the memory LBANN holds.** The optimizer allocates a
-resident, full-size gradient buffer for the linearity whatever the layer does,
-so the gradient makes a round trip through host memory in `bp_compute` rather
-than staying paged. `SgdUpdate` is what avoids that, and it does so by
-bypassing LBANN's optimizer rather than feeding it. Wiring the paged optimizer
-in properly means replacing LBANN's optimizer for that weight, which is a
-larger change than a layer hook.
+**The default path still round-trips the gradient.** The optimizer allocates a
+resident, full-size gradient buffer whatever the layer does, so `bp_compute`
+folds the paged gradient into it through host memory. `LBANN_ETERNIA_FC_OWN_WEIGHTS`
+is the answer to that -- see below -- but it is a mode, not the default.
+
+Letting the paged store own the weights
+---------------------------------------
+
+`LBANN_ETERNIA_FC_OWN_WEIGHTS` makes the paged vector the authoritative copy of
+W. `bp_compute` then calls `SgdUpdate` directly instead of feeding LBANN's
+optimizer, so **dW never leaves the paged vector and W is never reassembled
+anywhere**. Two consequences fall out of that and both had to be handled:
+
+- The weights are uploaded ONCE. Re-uploading each call, as the default path
+  does, would overwrite every update with the pre-training weights and the
+  model would never learn.
+- LBANN steps every weight each iteration regardless of what the layer did, so
+  the gradient buffer is ZEROED rather than ignored -- a stale gradient there
+  would be applied on top of the update just made. That makes LBANN's step a
+  no-op, which is only true because this model uses plain SGD with no momentum.
+  An optimizer carrying state would need its state suppressed too.
+
+`LBANN_ETERNIA_CHECK` is suppressed in this mode: Hydrogen's copy of W is stale
+after the first step, so an `El::Gemm` reference built from it would measure
+the staleness rather than the kernel.
+
+That removes the usual way of checking the result, so the evidence is
+different. LBANN's optimizer is neutralized by the zeroed buffer, meaning the
+Hydrogen weights cannot change -- yet the model still learns, and learns to the
+same objective as stock. It follows that the learning is coming from the paged
+store and nowhere else. `LBANN_ETERNIA_STATS=1` prints the six
+`own-weights step lr=0.01` lines (2 layers x 3 epochs) that confirm the branch
+runs at all, which an identical objective on its own would not.
+
+Combined with a cache one thirty-second of the weight matrix:
+
+| run | epoch 1 | epoch 2 | epoch 3 |
+|---|---|---|---|
+| `El::Gemm` (stock) | 2.11687 | 2.06452 | 1.87059 |
+| own-weights, default cache | 2.11687 | 2.06452 | 1.87059 |
+| own-weights, 64 KiB cache vs 2 MiB W | 2.11687 | 2.06452 | 1.87059 |
+
+The last row takes 3584 faults against 3568 evictions.
+
+What is still NOT saved: Hydrogen's `DistMatrix` for the linearity continues to
+exist, because LBANN's `weights` object owns it and the model serializes and
+checkpoints through it. Removing that is a change to LBANN's weights ownership,
+not to this layer.
 
 Under real paging pressure
 --------------------------
