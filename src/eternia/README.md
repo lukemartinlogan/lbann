@@ -454,37 +454,43 @@ It is NOT the known per-fault SHM segment growth. Holding the weights fixed at
 and moves RSS by 1% (2654 -> 2624 MB). The amplification tracks DATA, not
 paging activity.
 
-Partially localised, by reading `/proc/<pid>/smaps` at peak (the mapping totals
-reconcile with `VmRSS`, 4033 MB against 4020 MB, so the breakdown is the whole
-of RSS and not a sample of it). At 256 MiB of weights:
+Partially localised by reading `/proc/<pid>/smaps`, sampled twice a second and
+kept at the highest `VmRSS` seen. Broken down by mapping class:
 
-| mapping | RSS |
-|---------|-----|
-| `[anon rw]` | 2209 MB |
-| `memfd:clio_rambdev` | 769 MB |
-| `/dev/zero (deleted)` | 376 MB |
-| `memfd:chi_metadata_segment` | 299 MB |
+| W (MiB) | total | anon | `clio_rambdev` | `/dev/zero` | `chi_metadata` |
+|---------|-------|------|----------------|-------------|----------------|
+| 64      | 2561  | 1496 | 193            | 192         | 299 |
+| 256     | 4354  | 2212 | 1025           | 436         | 299 |
+| 1024    | 6257  | 4270 | 1024           | 284         | 299 |
 
-Three things are now ruled out, each by measurement rather than reasoning:
+Three things are ruled out, each by measurement rather than reasoning:
 
 - **Not the config.** The CTE `ram` tier's `capacity_limit` (1024 / 4096 / 8192
   MB) and the `clio_bdev` pool's `capacity` (256MB / 1GB / 4GB) each move peak
-  RSS by less than 0.1%. Unlike the `hbm` tier, neither is preallocated.
+  RSS by less than 0.1% at small weights. Unlike the `hbm` tier, neither is
+  preallocated.
 - **Not paging activity.** 8x fewer faults at fixed weights moves RSS 1%.
-- **Not an unbounded leak.** The RAM bdev grows 582 -> 768 MB from one epoch to
-  two and then stops: 768 MB at both 2 and 4 epochs. It reaches a steady state
-  after the first optimizer step rather than accumulating per step.
+- **Not an unbounded leak.** The RAM bdev goes 582 -> 768 MB from one epoch to
+  two and then stops, unchanged at four.
 
-What is left is a steady state that is simply larger than the data: the RAM
-bdev holds **3x W** where only W and dW exist as blobs, i.e. one whole extra
-copy of the weight matrix beyond the two the design calls for. Finding what
-that third copy is -- a retained prior version, a write-through replica, or
-allocator slack that never reclaims -- is the next concrete step, and it is
-worth roughly a third of the amplification.
+The growth is in ANONYMOUS memory, which rises about 2.9x W across the range
+while the RAM bdev saturates at the `clio_bdev` capacity of 1 GB and the
+metadata segment stays fixed at 299 MiB. LBANN's own host copy of the linearity
+and its CPU gradient buffer account for 2x W of the anonymous growth by design,
+leaving roughly 0.9x W unattributed.
 
-The remaining growth is in anonymous mappings. LBANN's own host copy of the
-linearity and its CPU gradient buffer account for 2x W of that by design; the
-rest is not yet attributed.
+Two caveats on this table, both of which matter:
+
+1. An earlier revision read the RAM bdev as holding "3x W, one entire extra
+   copy of the weights". That was wrong -- arithmetic done loosely between MB
+   and MiB, and without noticing the bdev SATURATES. It does not scale with the
+   weights at all, and it is not where the amplification comes from.
+2. The totals here are LOWER BOUNDS. `/usr/bin/time -v` reports 11697 MB peak
+   for the 1 GiB model where this sampler's best was 6257 MiB, so a
+   twice-a-second poll misses most of a transient peak. The composition above is
+   real but it is the composition of a sampled moment, not of the true maximum,
+   and the missing ~5 GB is the next thing to chase -- with a sampler that can
+   actually catch it.
 
 ### Larger than VRAM (the kernel, driven directly)
 
