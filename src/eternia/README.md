@@ -144,6 +144,41 @@ rounding on a sum of 65536 products. The GPU-side cache is
 `blocks * slots * page` = 64 * 8 * 256 KB = 128 MB, about 1.25% of the
 matrix.
 
+## Validated inside LBANN, on a real model
+
+`lbann_eternia_gemm_verify` proves the boundary; it does not prove the
+integration in a running model. That distinction mattered on the GROMACS side
+of this project, where a boundary test passed while three assumptions about
+the host's data were wrong, so the same check is made here.
+
+A small MLP (64 -> 32 -> 4, `transpose: true`, no bias) on the synthetic data
+reader, run with and without `LBANN_ETERNIA_FC=1`. The baseline is
+deterministic: three consecutive runs give 1.97502 exactly, so any difference
+is real rather than run-to-run noise.
+
+**The forward pass is exact.** With the weights frozen (`learn_rate: 0.0`)
+both paths give an objective of 1.98758. With one update per epoch
+(mini-batch = all 256 samples) epoch 0 is 1.93652 for both -- that epoch sees
+only the initial weights, so it is a direct comparison of the forward GEMM
+inside a running model.
+
+**Something after the first update is not yet identical.** From epoch 1 the
+trajectories separate:
+
+| epoch | El::Gemm | eternia |
+|-------|----------|---------|
+| 0     | 1.93652  | 1.93652 |
+| 1     | 1.87546  | 1.88246 |
+| 2     | 1.87988  | 1.89347 |
+
+Since epoch 0 matches and backpropagation is untouched by this path, the
+divergence has to come from the weight gradients or from how the forward
+output reaches them -- not from the GEMM itself. It is NOT yet diagnosed, and
+the integration should not be described as validated for training until it
+is. The next measurement is to dump the weights after a single update and
+diff them, rather than inferring from an objective four operations
+downstream.
+
 ## Next, and what blocks it
 
 Wire into `src/layers/learning/fully_connected.cpp` behind a runtime switch.
