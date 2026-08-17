@@ -477,12 +477,34 @@ are stable across two decades of W:
 
 So the ~9.5x amplification decomposes as roughly 4x W in the CTE's RAM bdev,
 4x W in anonymous allocations, and a fixed ~1.5 GiB of baseline and metadata.
-Each of the two stores is a factor of two larger than what it holds, which is
-too clean to be coincidence and is the specific thing to chase next. The
-mechanism is NOT established -- double buffering on the put path, a retained
-prior generation, and allocator round-up all predict the same 2x -- and it
-should be identified rather than guessed, since three previous guesses in this
-file were wrong.
+
+### The doubling is TRANSIENT, not retained
+
+Sampling a rolling snapshot alongside the peak separates the two. At 256 MiB of
+weights, where the live blob data is 512 MiB:
+
+| | RAM bdev | anon | vs live blob data |
+|---|---|---|---|
+| steady state | 513 MiB | 149 MiB | **1.00x** |
+| peak | 1025 MiB | 2212 MiB | **2.00x** |
+
+At rest the bdev holds exactly the live data, to within a MiB. The second copy
+exists only while data is being written.
+
+That distinguishes the three candidates: a retained prior generation and
+allocator round-up would both persist at rest, and neither does. What is left
+is a staging copy on the put path -- one extra copy of what is being written,
+alive for the duration of the write.
+
+Two consequences worth acting on:
+
+- The ~9.5x is a PEAK requirement, not a working set. The process must be able
+  to allocate it, but it is not holding it, which is a materially different
+  constraint from the one the RSS number alone implies.
+- It does not scale with page size (32 KB and 256 KB pages give the same peak),
+  which says the staging is of the whole array rather than of a flush batch.
+  That points at the bulk write paths -- `UploadWeights` and the zero-fill that
+  creates dW's backing store -- rather than at per-page writeback.
 
 Three things are ruled out, each by measurement:
 
