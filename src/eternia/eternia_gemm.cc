@@ -65,6 +65,25 @@ __device__ gy::YCoroMain GemmCoro(gv::DeviceVector<float> W, const float* X,
   const u64 e0 = elem_lo[block], e1 = elem_hi[block];
   const u64 pe = W.h_->elems_per_page_;
 
+  // DROP THIS BLOCK'S CACHE FIRST.
+  //
+  // The host rewrites W's backing store on every call -- the weights change
+  // each optimizer step -- and NOTHING invalidates the pages already resident
+  // on the device. Without this the kernel keeps serving the weights from the
+  // first call for the rest of training.
+  //
+  // It shows up as a forward pass that is exact on the initial weights and
+  // wrong afterwards: measured against El::Gemm on the same inputs, the
+  // relative error was 1.4e-07 in epoch 0 and 1.2e-03 by epoch 1. The
+  // objective still fell, so training looked like it was working.
+  //
+  // The LAMMPS integration needed exactly this and for exactly this reason.
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    W.DropAll();
+  }
+  __syncthreads();
+
   for (u64 off = e0; off < e1;) {
     const u64 seg_end = ((off / pe) + 1) * pe < e1 ? ((off / pe) + 1) * pe : e1;
     co_await W.HoldPageCoro(off, seg_end - off, &run);

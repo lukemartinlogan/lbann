@@ -30,6 +30,8 @@
 #include "eternia_gemm.h"
 #include <cstdlib>
 #include <iostream>
+#include <algorithm>
+#include <cmath>
 #include <type_traits>
 
 #include "lbann/optimizers/optimizer.hpp"
@@ -923,12 +925,44 @@ void fully_connected_layer<TensorDataType, T_layout, Dev>::fp_compute()
         // The uploader reads host memory; Hydrogen keeps the weights on GPU.
         El::Matrix<TensorDataType, El::Device::CPU> host_lin;
         El::Copy(lin, host_lin);
+        // LBANN_ETERNIA_CHECK: compute the SAME product with El::Gemm and
+        // report the largest elementwise difference. Inferring correctness
+        // from an objective several operations downstream is how a paging bug
+        // gets read off an energy total; this measures the thing itself.
+        static const bool check = (std::getenv("LBANN_ETERNIA_CHECK") != nullptr);
+        El::Matrix<TensorDataType, El::Device::GPU> ref;
+        if (check) {
+          El::Copy(out, ref);
+          El::Gemm(El::TRANSPOSE,
+                   El::NORMAL,
+                   El::TypeTraits<TensorDataType>::One(),
+                   lin,
+                   in,
+                   El::TypeTraits<TensorDataType>::Zero(),
+                   ref);
+        }
         if (eternia_fc_gemm(
               m_eternia_ctx, m_eternia_h, m_eternia_w, this,
               reinterpret_cast<const float*>(host_lin.LockedBuffer()),
               host_lin.LDim(), lin.Height(), lin.Width(),
               reinterpret_cast<const float*>(in.LockedBuffer()), in.LDim(),
               in.Width(), reinterpret_cast<float*>(out.Buffer()), out.LDim())) {
+          if (check) {
+            El::Matrix<TensorDataType, El::Device::CPU> a, b;
+            El::Copy(out, a);
+            El::Copy(ref, b);
+            double maxd = 0.0, peak = 0.0;
+            for (El::Int j = 0; j < a.Width(); ++j) {
+              for (El::Int i = 0; i < a.Height(); ++i) {
+                const double x = a(i, j), y = b(i, j);
+                peak = std::max(peak, std::abs(y));
+                maxd = std::max(maxd, std::abs(x - y));
+              }
+            }
+            std::cerr << "[eternia-check] " << a.Height() << "x" << a.Width()
+                      << " max|diff|=" << maxd << " peak=" << peak
+                      << " rel=" << (peak > 0 ? maxd / peak : 0.0) << std::endl;
+          }
           return;
         }
       }

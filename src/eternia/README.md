@@ -162,22 +162,32 @@ both paths give an objective of 1.98758. With one update per epoch
 only the initial weights, so it is a direct comparison of the forward GEMM
 inside a running model.
 
-**Something after the first update is not yet identical.** From epoch 1 the
-trajectories separate:
+**Training matches too, once the device cache is dropped each call.** The
+first attempt did not: from epoch 1 the trajectories separated, and measuring
+the forward output against El::Gemm on the same inputs (`LBANN_ETERNIA_CHECK`)
+showed why -- relative error 1.4e-07 in epoch 0 but 1.2e-03 by epoch 1.
 
-| epoch | El::Gemm | eternia |
-|-------|----------|---------|
-| 0     | 1.93652  | 1.93652 |
-| 1     | 1.87546  | 1.88246 |
-| 2     | 1.87988  | 1.89347 |
+The weights change every optimizer step and the host rewrites the backing
+store, but NOTHING invalidates the pages already resident on the device, so
+the kernel kept serving the weights from the first call. The objective still
+fell, so training looked like it was working. `GemmCoro` now drops the
+block's cache before reading, exactly as the LAMMPS integration has to for
+coordinates.
 
-Since epoch 0 matches and backpropagation is untouched by this path, the
-divergence has to come from the weight gradients or from how the forward
-output reaches them -- not from the GEMM itself. It is NOT yet diagnosed, and
-the integration should not be described as validated for training until it
-is. The next measurement is to dump the weights after a single update and
-diff them, rather than inferring from an objective four operations
-downstream.
+With that, both paths agree digit for digit:
+
+| schedule                  | El::Gemm                        | eternia                         |
+|---------------------------|---------------------------------|---------------------------------|
+| one update per epoch      | 1.93652 1.87546 1.87988         | 1.93652 1.87546 1.87988         |
+| 4 minibatches, 4 epochs   | 1.97502 1.82216 1.7951 1.91683  | 1.97502 1.82216 1.7951 1.91683  |
+
+and the forward difference stays at 1e-07 -- single-precision rounding -- at
+every epoch rather than growing.
+
+`LBANN_ETERNIA_CHECK=1` computes the same product with El::Gemm and reports
+the largest elementwise difference. It is worth keeping: inferring
+correctness from an objective several operations downstream is how a stale
+cache reads as a slightly different learning curve.
 
 ## Next, and what blocks it
 
