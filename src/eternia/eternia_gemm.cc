@@ -218,6 +218,70 @@ __device__ gy::YCoroMain GradCoro(gv::DeviceVector<float> dW, const float* dC,
   co_await FlushWaitCoro(dW);
 }
 
+/**
+ * W -= lr * dW over this block's page-aligned slice, with BOTH arrays paged.
+ *
+ * This is the step that closes out-of-core training, and the only one that
+ * holds a page from two paged vectors at the same time. That is safe here for
+ * a reason worth stating rather than assuming: page caches are PER BLOCK and
+ * per vector, so the two holds contend for nothing, and there is no cross-block
+ * lock either hold could wait behind. Nesting holds across vectors that shared
+ * a cache would be a different question.
+ *
+ * The two vectors are created with the same page size and the same length, so
+ * element e sits at the same offset within page e/pe of each. The slice loop
+ * therefore walks one page of W against exactly one page of dW rather than a
+ * straddling pair, which is what keeps a written page owned by a single block.
+ */
+__device__ gy::YCoroMain SgdCoro(gv::DeviceVector<float> W,
+                                 gv::DeviceVector<float> dW, float lr,
+                                 const u64* elem_lo, const u64* elem_hi,
+                                 u32 block)
+{
+  u64 run = 0;
+  const u64 e0 = elem_lo[block], e1 = elem_hi[block];
+  const u64 pe = W.h_->elems_per_page_;
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    // W's resident pages are stale twice over: the host may have rewritten the
+    // store, and the previous update wrote through this same cache.
+    W.DropAll();
+    dW.DropAll();
+  }
+  __syncthreads();
+
+  for (u64 off = e0; off < e1;) {
+    const u64 seg_end = ((off / pe) + 1) * pe < e1 ? ((off / pe) + 1) * pe : e1;
+    co_await W.HoldPageCoro(off, seg_end - off, &run);
+    co_await dW.HoldPageCoro(off, seg_end - off, &run);
+
+    for (u64 e = off + threadIdx.x; e < seg_end; e += blockDim.x) {
+      W[e] = W.at(e) - lr * dW.at(e);
+    }
+    __syncthreads();
+    if (threadIdx.x == 0) {
+      W.BeginFlush(off, seg_end - off);
+    }
+    __syncthreads();
+    off = seg_end;
+  }
+  co_await FlushWaitCoro(W);
+}
+
+__global__ void SgdKernel(clio::run::IpcManagerGpuInfo info,
+                          gv::DeviceVector<float> W, gv::DeviceVector<float> dW,
+                          float lr, const u64* elem_lo, const u64* elem_hi,
+                          gy::YieldableView<> yv, gy::YieldStackView ys)
+{
+  CLIO_GPU_INIT(info, nullptr);
+  W.block_override_ = yv.Block();
+  dW.block_override_ = yv.Block();
+  gy::YieldTlsPublish(ys, yv.Y(), yv.Block());
+  __syncthreads();
+  CLIO_YCORO_RUN(SgdCoro(W, dW, lr, elem_lo, elem_hi, yv.Block()));
+}
+
 __global__ void GradKernel(clio::run::IpcManagerGpuInfo info,
                            gv::DeviceVector<float> dW, const float* dC, int ldc,
                            const float* X, int ldx, u64 m, u64 k, u64 n,
@@ -566,6 +630,38 @@ bool WeightGradient(Context* ctx, const float* dc_device, int ldc, int n,
 #endif
 }
 
+bool SgdUpdate(Context* ctx, float learning_rate)
+{
+#if !defined(ETERNIA_LBANN_CORO)
+  (void)ctx; (void)learning_rate;
+  SetErr("built without the paged backend");
+  return false;
+#else
+  if (!ctx) { SetErr("SgdUpdate: null context"); return false; }
+  if (ctx->dW == nullptr) {
+    SetErr("SgdUpdate: no gradient -- call WeightGradient first");
+    return false;
+  }
+  auto gpu = CLIO_CPU_IPC->GetGpuIpcManager()->GetGpuInfo(ctx->cfg.gpu_id);
+  auto dW_dev = ctx->W->GetDevice(ctx->cfg.gpu_id);
+  auto ddW = ctx->dW->GetDevice(ctx->cfg.gpu_id);
+  YieldRunner runner(ctx->cfg.nblocks, ctx->cfg.nthreads);
+  const u32 rounds = runner.Run(
+    [&](dim3 g, dim3 b, gy::YieldableView<> v, gy::YieldStackView sv) {
+      SgdKernel<<<g, b, CLIO_YIELD_SMEM_BYTES>>>(
+        gpu, dW_dev, ddW, learning_rate, ctx->d_lo, ctx->d_hi, v, sv);
+    });
+  const cudaError_t le = cudaGetLastError();
+  if (le != cudaSuccess) { SetErr(cudaGetErrorString(le)); return false; }
+  if (cudaDeviceSynchronize() != cudaSuccess) {
+    SetErr(cudaGetErrorString(cudaGetLastError()));
+    return false;
+  }
+  if (rounds == 0) { SetErr("yield driver made no progress"); return false; }
+  return true;
+#endif
+}
+
 bool ReadWeightGradient(Context* ctx, float* dw_colmajor, int ldim)
 {
 #if !defined(ETERNIA_LBANN_CORO)
@@ -625,6 +721,7 @@ bool UploadWeights(Context*, const float*, int) { return false; }
 bool Forward(Context*, const float*, int, int, float*, int) { return false; }
 bool BackwardInput(Context*, const float*, int, int, float*, int) { return false; }
 bool WeightGradient(Context*, const float*, int, int, const float*, int) { return false; }
+bool SgdUpdate(Context*, float) { return false; }
 bool ReadWeightGradient(Context*, float*, int) { return false; }
 Stats GetStats(Context*) { return Stats(); }
 }  // namespace eternia_lbann

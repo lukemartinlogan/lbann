@@ -154,6 +154,20 @@ bool WeightGradient(Context* ctx, const float* dc_device, int ldc, int n,
                     const float* x_device, int ldx);
 
 /**
+ * W -= learning_rate * dW, entirely on the GPU, with BOTH W and dW paged.
+ *
+ * This is what makes the whole path out-of-core rather than merely
+ * out-of-core-until-the-update: reading the gradient back to the host and
+ * letting the optimizer touch a resident copy of W would put a full-size
+ * weight matrix back in memory once per step and give all the capacity away.
+ *
+ * Requires a preceding WeightGradient; there is no gradient to apply
+ * otherwise, and silently doing nothing would look exactly like a model that
+ * fails to learn.
+ */
+bool SgdUpdate(Context* ctx, float learning_rate);
+
+/**
  * Copy the paged weight gradient back into a host buffer laid out the way
  * Hydrogen holds W: column-major (h x w) with leading dimension `ldim`.
  */

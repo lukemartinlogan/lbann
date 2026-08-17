@@ -195,8 +195,18 @@ has scoped but not built:
 
    `ReadWeightGradient` copies it back into Hydrogen's column-major layout.
 
-3. The optimizer update over paged W and paged dW, page by page. Still to do,
-   and now the only piece missing.
+3. The optimizer update over paged W and paged dW -- **done**. `SgdUpdate`
+   computes `W -= lr * dW` entirely on the GPU with both arrays paged. Reading
+   the gradient back and letting the optimizer touch a resident copy of W
+   would put a full-size weight matrix in memory once per step and give the
+   whole capacity argument away, so the update has to be paged too.
+
+   It is the only kernel that holds a page from TWO paged vectors at once.
+   That is safe because page caches are per block and per vector, so the two
+   holds contend for nothing and neither waits behind a cross-block lock. Both
+   vectors use the same page size and length, so element `e` sits at the same
+   offset in page `e/pe` of each and one page of W is updated against exactly
+   one page of dW.
 
 All three kernels are validated together in `lbann_eternia_gemm_verify`
 against independent host references, across page sizes 4KB-256KB, 13-64
@@ -208,15 +218,30 @@ most of what they fault:
 | forward         | 3.5e-08        |
 | backward-input  | 4.3e-07        |
 | weight gradient | 5.2e-08        |
+| SGD update      | 3.8e-08        |
 
 Each is checked separately rather than assumed to follow from the others:
-they are three different kernels with three different access patterns, and
-this project has repeatedly found that the second and third are where an
-assumption breaks.
+they are four different kernels with four different access patterns, and this
+project has repeatedly found that the later ones are where an assumption
+breaks.
 
-Until the optimizer step exists the host-weights option remains experimental:
-the pieces are in place and validated, but nothing yet drives them as a
-training step.
+The update is checked by running the FORWARD kernel again against a reference
+built from the updated weights, not by reading W back. That is the stronger
+check: it only passes if the update reached the backing store the forward pass
+reads, so a write that stayed in a block's page cache and never flushed fails
+it. The test also asserts the weights actually MOVED, because an update that
+silently did nothing would track a reference built from the old weights just
+as closely and pass a naive tolerance check.
+
+The tightest configuration in the sweep is `--slots 2`: the update kernel
+holds a page from each of two vectors, and two slots per vector is the least
+that can serve it.
+
+All four pieces of an out-of-core training step now exist and are validated at
+the boundary. What is NOT yet done is driving them from LBANN's own
+`bp_compute`: only the forward GEMM is wired into the layer, so
+`LBANN_ETERNIA_FC_HOST_WEIGHTS` still fails inside backprop. The remaining
+work is wiring, not kernels.
 
 ### Larger than VRAM (the kernel, driven directly)
 

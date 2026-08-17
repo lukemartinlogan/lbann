@@ -205,6 +205,50 @@ int main(int argc, char** argv)
     }
   }
 
+  // ---- optimizer step: W -= lr * dW, both paged ----
+  // Checked by running the FORWARD kernel again against a reference computed
+  // from the updated weights, rather than by reading W back. That is the
+  // stronger check of the two: it only passes if the update reached the
+  // backing store the forward pass reads, so a write that stayed in some
+  // block's page cache and never flushed would fail it.
+  const float lr = 0.01f;
+  double umax = 0.0, upeak = 0.0;
+  if (!eternia_lbann::SgdUpdate(ctx, lr)) {
+    std::fprintf(stderr, "SgdUpdate failed: %s\n", eternia_lbann::LastError());
+    return 1;
+  }
+  {
+    std::vector<float> Wn(W.size());
+    for (size_t q = 0; q < W.size(); ++q) {
+      Wn[q] = W[q] - lr * static_cast<float>(refdW[q]);
+    }
+    std::vector<double> refC2;
+    reference(Wn, h, w, X, k, n, &refC2);
+    if (!eternia_lbann::Forward(ctx, dX, k, n, dC, m)) {
+      std::fprintf(stderr, "Forward after update failed: %s\n",
+                   eternia_lbann::LastError());
+      return 1;
+    }
+    std::vector<float> got2(static_cast<size_t>(m) * n);
+    cudaMemcpy(got2.data(), dC, got2.size() * sizeof(float),
+               cudaMemcpyDeviceToHost);
+    for (size_t q = 0; q < got2.size(); ++q) {
+      upeak = std::max(upeak, std::fabs(refC2[q]));
+      umax = std::max(umax, std::fabs(refC2[q] - static_cast<double>(got2[q])));
+    }
+    // An update that silently did nothing would still track a reference built
+    // from the OLD weights closely, so assert the weights actually moved.
+    double moved = 0.0;
+    for (size_t q = 0; q < got2.size(); ++q) {
+      moved = std::max(moved, std::fabs(refC2[q] - ref[q]));
+    }
+    if (moved <= 1e-4) {
+      std::fprintf(stderr, "update is a no-op (max change %.4e) -- "
+                   "the test would not detect a broken SgdUpdate\n", moved);
+      return 1;
+    }
+  }
+
   const auto st = eternia_lbann::GetStats(ctx);
   double maxd = 0.0, peak = 0.0;
   for (size_t i = 0; i < got.size(); ++i) {
@@ -216,18 +260,21 @@ int main(int argc, char** argv)
   const double tol = 1e-5 * std::max(peak, 1.0) * std::sqrt(static_cast<double>(k));
   const double btol = 1e-5 * std::max(bpeak, 1.0) * std::sqrt(static_cast<double>(m));
   const double gtol = 1e-5 * std::max(gpeak, 1.0) * std::sqrt(static_cast<double>(n));
+  const double utol = 1e-5 * std::max(upeak, 1.0) * std::sqrt(static_cast<double>(k));
   const bool ok = (maxd <= tol) && (bmax <= btol) && (gmax <= gtol) &&
-                  (st.get_errors == 0);
+                  (umax <= utol) && (st.get_errors == 0);
 
   std::printf("W=%dx%d (W^T = %dx%d)  X=%dx%d  page=%lluKB blocks=%u slots=%u\n"
               "  faults=%llu evicts=%llu get_errors=%llu\n"
               "  fwd max|diff|=%.4e peak=%.4e tol=%.4e\n"
               "  bwd max|diff|=%.4e peak=%.4e tol=%.4e\n"
-              "  dW  max|diff|=%.4e peak=%.4e tol=%.4e\n%s\n",
+              "  dW  max|diff|=%.4e peak=%.4e tol=%.4e\n"
+              "  sgd max|diff|=%.4e peak=%.4e tol=%.4e\n%s\n",
               h, w, m, k, k, n, (unsigned long long)page_kb, blocks, slots,
               (unsigned long long)st.faults, (unsigned long long)st.evicts,
               (unsigned long long)st.get_errors, maxd, peak, tol,
-              bmax, bpeak, btol, gmax, gpeak, gtol, ok ? "PASS" : "FAIL");
+              bmax, bpeak, btol, gmax, gpeak, gtol, umax, upeak, utol,
+              ok ? "PASS" : "FAIL");
   eternia_lbann::Destroy(ctx);
   return ok ? 0 : 1;
 }
