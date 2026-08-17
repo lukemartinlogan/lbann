@@ -28,6 +28,7 @@
 #include "lbann/layers/learning/fully_connected.hpp"
 
 #include "eternia_gemm.h"
+#include "lbann/optimizers/sgd.hpp"
 #include <cstdlib>
 #include <iostream>
 #include <algorithm>
@@ -1176,6 +1177,33 @@ void fully_connected_layer<TensorDataType, T_layout, Dev>::bp_compute()
             // the update just made. Zeroing makes that step a no-op, which is
             // only true because this model uses plain SGD with no momentum;
             // an optimizer with state would need its state suppressed too.
+            // Zeroing the gradient neutralizes LBANN's own step, but ONLY
+            // for a stateless optimizer. Anything carrying accumulated state
+            // -- momentum, Adam's moments, Adagrad's history -- keeps applying
+            // that state to weights this layer has already updated, and the
+            // run would train to a quietly wrong answer while every counter
+            // stayed clean. Refuse instead of mis-training: this project has
+            // shipped enough paths that reported success while losing data.
+            {
+              const std::string ty = opt->get_type();
+              const auto* sgd_opt =
+                dynamic_cast<const sgd<TensorDataType>*>(opt);
+              if (sgd_opt == nullptr) {
+                LBANN_ERROR("LBANN_ETERNIA_FC_OWN_WEIGHTS supports only plain "
+                            "SGD, but this weight uses ",
+                            ty,
+                            ". A stateful optimizer would keep stepping "
+                            "weights the paged store has already updated.");
+              }
+              if (sgd_opt->get_momentum() !=
+                  El::TypeTraits<TensorDataType>::Zero()) {
+                LBANN_ERROR("LBANN_ETERNIA_FC_OWN_WEIGHTS supports only SGD "
+                            "with zero momentum, but this weight has momentum ",
+                            sgd_opt->get_momentum(),
+                            ". Momentum would be applied on top of the update "
+                            "the paged store just made.");
+              }
+            }
             auto& gbuf =
               opt->get_gradient_buffer(dst_scale, gradient_scale, true);
             El::Zero(gbuf.Matrix());

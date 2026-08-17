@@ -301,9 +301,26 @@ anywhere**. Two consequences fall out of that and both had to be handled:
   model would never learn.
 - LBANN steps every weight each iteration regardless of what the layer did, so
   the gradient buffer is ZEROED rather than ignored -- a stale gradient there
-  would be applied on top of the update just made. That makes LBANN's step a
-  no-op, which is only true because this model uses plain SGD with no momentum.
-  An optimizer carrying state would need its state suppressed too.
+  would be applied on top of the update just made.
+
+Zeroing the gradient neutralizes LBANN's step only for a STATELESS optimizer.
+Anything carrying accumulated state -- momentum, Adam's moments, Adagrad's
+history -- keeps applying that state to weights the paged store has already
+updated, and the run would train to a quietly wrong answer with every counter
+clean. The mode therefore REFUSES rather than mis-trains:
+
+    LBANN_ETERNIA_FC_OWN_WEIGHTS supports only SGD with zero momentum, but
+    this weight has momentum 0.9. Momentum would be applied on top of the
+    update the paged store just made.
+
+    LBANN_ETERNIA_FC_OWN_WEIGHTS supports only plain SGD, but this weight
+    uses Adam. A stateful optimizer would keep stepping weights the paged
+    store has already updated.
+
+The refusal is narrow, and that was checked rather than assumed: the same
+momentum model runs fine on the ordinary paged path and matches stock exactly
+(1.83390, distinct from the zero-momentum 1.87059 -- so momentum really is
+active in the comparison).
 
 `LBANN_ETERNIA_CHECK` is suppressed in this mode: Hydrogen's copy of W is stale
 after the first step, so an `El::Gemm` reference built from it would measure
