@@ -131,7 +131,31 @@ and wrong in practice.
 The 333 x 177 / n=5 / 13-block row is deliberately non-power-of-two, so rows
 straddle page boundaries and blocks own ragged slices.
 
-### Larger than VRAM
+### IMPORTANT: the integration does not lift LBANN's VRAM ceiling
+
+The numbers below are for the KERNEL, driven directly. They are not what the
+integration delivers, and the difference matters.
+
+LBANN allocates the weight matrix itself, as a Hydrogen matrix on the GPU.
+This hook reads that matrix and copies it into the CTE; it does not replace
+where LBANN keeps its weights. So a layer whose weights exceed VRAM fails in
+LBANN's own allocator before the paged kernel is ever reached:
+
+    32768 x 65536 = 8.00 GiB
+    Failed to allocate GPU memory with message: "out of memory"
+      (8589934592 bytes requested, 8032092160 bytes available)
+
+with LBANN_ETERNIA_FC=1 set. The paged GEMM is therefore validated as a
+drop-in for the forward GEMM -- exact, including across training -- and as a
+kernel that scales past VRAM when driven directly. It is NOT a way to train a
+layer wider than GPU memory, and nothing here should be read as claiming that.
+
+Getting that would mean the weights LIVING in the CTE rather than being
+copied into it: replacing `weights`' storage, which the optimizer, the
+gradient buffers and checkpointing all touch. That is a much deeper change
+than swapping the GEMM, and it is not attempted here.
+
+### Larger than VRAM (the kernel, driven directly)
 
 On an 8 GiB (7.99 GiB usable) RTX 4070 Laptop:
 
